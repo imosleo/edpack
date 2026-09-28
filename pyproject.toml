@@ -11,11 +11,11 @@ license = { text = "MIT" }
 authors = [{ name = "Ian Leong Zheng Yan" }]
 requires-python = ">=3.9"
 keywords = ["edstem", "ed", "lessons", "notebooklm", "monash", "offline"]
+dependencies = ["requests", "beautifulsoup4", "markdownify", "pymupdf"]
 
 [project.urls]
 Homepage = "https://github.com/imosleo/edpack"
 Issues = "https://github.com/imosleo/edpack/issues"
-dependencies = ["requests", "beautifulsoup4", "markdownify", "pymupdf"]
 
 [project.scripts]
 edpack = "edpack:main"
