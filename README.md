@@ -126,6 +126,15 @@ If the audit flags something, a file comes out garbled, or your unit uses a form
 
 No language model is involved anywhere. It is deterministic Python, so the same input gives the same output every time.
 
+## References and prior art
+
+Everything edpack relies on is either documented by Ed or observable in your own browser.
+
+- **Ed's API documentation.** On the API Tokens settings page (https://edstem.org/au/settings/api-tokens), the **Learn more about Ed API** button opens Ed's own reference. It states that the API server is `https://edstem.org/api`, that a token is sent as an `Authorization: Bearer <token>` header, and that "Ed APIs are provided as is and may change without notice." The same page labels API access as beta. That documentation covers the user endpoint; edpack uses it to list your courses.
+- **The Lessons endpoints** (`/courses/{id}/lessons`, `/lessons/{id}`, `/lessons/slides/{id}`, `/lessons/slides/{id}/questions`, `/challenges/{id}`) are not in that published reference. They were identified by watching the requests Ed's own web app makes when you open a lesson, so they carry exactly the permissions your account already has. Ed may rename them at any time, which is the main way this tool could break.
+- **Prior art:** [edapi](https://github.com/smartspot2/edapi) by smartspot2, an unofficial Python integration of the Ed API (GPL-3.0), documents the same token approach and is where it was first shown that the API is stable enough to build on. edpack does not use or include it.
+- **NotebookLM source limits** are taken from the counter in NotebookLM's own Add sources dialog (50 per notebook on free, 300 on Pro at the time of writing).
+
 ## License
 
 MIT. Use it, fork it, fix it. Just keep your token out of your commits.
