@@ -70,8 +70,9 @@ If Windows says `edpack` is not recognised, pip printed the folder it installed 
 edpack never sees your password. It uses a personal API token that Ed issues to you.
 
 1. Log in to Ed in your browser.
-2. Open **https://edstem.org/au/settings/api-tokens** (swap `au` for `us` or `eu` if that is where your school's Ed lives).
-3. Click **New token**, give it a name like `edpack`, and copy it.
+2. Paste this into the address bar: **https://edstem.org/au/settings/api-tokens** (swap `au` for `us` or `eu` if that is where your school's Ed lives).
+   The page is **not linked from the Settings menu** because Ed's API is still in beta, so you have to open it by URL. Once you are on it, an "API Tokens" entry appears in the left menu.
+3. Click **Create Token** and copy the value. Ed shows it only once; afterwards the list shows just the first few characters.
 4. Run `edpack` for the first time. It will ask for the token and save it to `~/.edpack/config.json`.
 
 Keep the token private. It grants the same read access to Ed that you have. If it ever leaks, delete it on that same page and make a new one; run `edpack setup` to store the replacement.
