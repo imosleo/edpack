@@ -127,4 +127,4 @@ No language model is involved anywhere. It is deterministic Python, so the same 
 
 ## License
 
-MIT. Use it, fork it, fix it. Just keep the token out of your commits.
+MIT. Use it, fork it, fix it. Just keep your token out of your commits.
