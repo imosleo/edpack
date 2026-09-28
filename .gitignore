@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+
+# archives produced by the tool (keep your notes out of the repo)
+**/_raw/
+**/NotebookLM upload/
+Week */
+ed-*/
+
+# never commit a token
+config.json
+token.txt

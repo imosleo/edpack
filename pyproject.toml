@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edpack"
+version = "0.1.0"
+description = "Archive Ed Lessons into an offline, NotebookLM-ready folder. No AI involved."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Ian Leong Zheng Yan" }]
+requires-python = ">=3.9"
+keywords = ["edstem", "ed", "lessons", "notebooklm", "monash", "offline"]
+
+[project.urls]
+Homepage = "https://github.com/imosleo/edpack"
+Issues = "https://github.com/imosleo/edpack/issues"
+dependencies = ["requests", "beautifulsoup4", "markdownify", "pymupdf"]
+
+[project.scripts]
+edpack = "edpack:main"
+
+[tool.setuptools]
+py-modules = ["edpack"]

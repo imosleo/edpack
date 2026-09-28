@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""edpack - archive Ed Lessons into an offline, NotebookLM-ready folder.
+
+No AI, no browser. Plain Python + the Ed API.
+
+Usage:
+  python edpack.py setup                      # store your Ed API token
+  python edpack.py fetch  --course 20603 --weeks 1        # download raw data
+  python edpack.py build  --course 20603                  # raw -> folders + Markdown
+  python edpack.py nblm   --course 20603                  # NotebookLM upload folder
+  python edpack.py audit  --course 20603                  # self-check report
+  python edpack.py run    --course 20603 --weeks 1-8      # all of the above
+
+Get a token at https://edstem.org/<region>/settings/api-tokens
+"""
+import argparse, hashlib, json, os, re, sys, time
+from urllib.parse import urljoin, urlparse
+
+try:
+    import requests
+    from bs4 import BeautifulSoup, NavigableString, Tag
+    from markdownify import markdownify as md
+    import pymupdf
+except ImportError as e:
+    sys.exit('Missing dependency: %s\nRun:  pip install requests beautifulsoup4 markdownify pymupdf' % e.name)
+
+# Windows consoles often default to a legacy code page; course names can contain any Unicode.
+for _stream in (sys.stdout, sys.stderr):
+    try: _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception: pass
+
+CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.edpack')
+CONFIG = os.path.join(CONFIG_DIR, 'config.json')
+API = 'https://edstem.org/api'
+
+
+# ----------------------------------------------------------------------------- helpers
+def log(msg): print(msg, flush=True)
+
+def safe(name):
+    name = name.replace(':', ' -').replace('/', '-').replace('\\', '-')
+    name = re.sub(r'[<>"|?*\x00-\x1f]', '', name)
+    return re.sub(r'\s+', ' ', name).strip(' .')[:120]
+
+def load_config():
+    if os.path.exists(CONFIG):
+        return json.load(open(CONFIG, encoding='utf-8'))
+    return {}
+
+def token():
+    t = os.environ.get('ED_TOKEN') or load_config().get('token')
+    if not t:
+        sys.exit('No Ed API token. Run:  python edpack.py setup   (or set ED_TOKEN)')
+    return t
+
+def parse_weeks(spec):
+    if not spec: return None
+    out = set()
+    for part in spec.split(','):
+        if '-' in part:
+            a, b = part.split('-'); out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+class Ed:
+    def __init__(self, tok):
+        self.s = requests.Session()
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.1'})
+
+    def get(self, path, **kw):
+        for attempt in range(3):
+            r = self.s.get(API + path, timeout=60, **kw)
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2); continue
+            if r.status_code in (400, 401) and 'token' in r.text.lower():
+                sys.exit('Ed rejected the token (%s). Make a new one at Settings > API tokens.' % r.status_code)
+            r.raise_for_status()
+            return r.json()
+        r.raise_for_status()
+
+
+class Cache:
+    """Byte cache for public files (reading pages, images, PDFs) so rebuilds work offline."""
+    def __init__(self, d):
+        self.d = d; os.makedirs(d, exist_ok=True)
+        self.s = requests.Session(); self.s.headers['User-Agent'] = 'Mozilla/5.0'
+
+    def get(self, url):
+        p = os.path.join(self.d, hashlib.sha1(url.encode()).hexdigest())
+        if os.path.exists(p):
+            return open(p, 'rb').read()
+        r = self.s.get(url, timeout=60); r.raise_for_status()
+        open(p, 'wb').write(r.content)
+        return r.content
+
+
+# ----------------------------------------------------------------------------- fetch
+def cmd_fetch(a):
+    ed = Ed(token())
+    weeks = parse_weeks(a.weeks)
+    L = ed.get('/courses/%s/lessons' % a.course)
+    modules = L.get('modules') or []
+    lessons = L.get('lessons') or []
+    dump = {'course': a.course, 'fetched_at': time.strftime('%Y-%m-%d %H:%M'), 'modules': [], 'errors': []}
+
+    # Lessons are grouped by module; modules are usually named "Week N: ...".
+    groups = []
+    for m in modules:
+        wk = re.search(r'week\s*(\d+)', m['name'], re.I)
+        groups.append({'id': m['id'], 'name': m['name'], 'week': int(wk.group(1)) if wk else None})
+    unmoduled = [l for l in lessons if not any(l.get('module_id') == g['id'] for g in groups)]
+    if unmoduled:
+        groups.append({'id': None, 'name': 'Other lessons', 'week': None})
+
+    selected = [g for g in groups if weeks is None or g['week'] in weeks]
+    total = sum(l.get('slide_count') or 0 for g in selected
+                for l in ([x for x in lessons if x.get('module_id') == g['id']] if g['id'] else unmoduled))
+    done = 0
+    for g in selected:
+        ls = [l for l in lessons if l.get('module_id') == g['id']] if g['id'] else unmoduled
+        ls.sort(key=lambda l: (l.get('index') if l.get('index') is not None else 999, l['id']))
+        G = {'id': g['id'], 'name': g['name'], 'week': g['week'], 'lessons': []}
+        log('\n%s' % g['name'])
+        for l in ls:
+            log('  %s' % l['title'])
+            d = ed.get('/lessons/%s?view=1' % l['id'])['lesson']
+            les = {'id': l['id'], 'title': l['title'], 'status': l.get('status'), 'slides': []}
+            for s in d.get('slides') or []:
+                done += 1
+                progress(done, total, s['title'])
+                S = {'id': s['id'], 'type': s['type'], 'title': s['title'], 'status': s.get('status')}
+                try:
+                    S['detail'] = ed.get('/lessons/slides/%s?view=1' % s['id'])['slide']
+                    if s['type'] == 'quiz':
+                        S['questions'] = ed.get('/lessons/slides/%s/questions' % s['id']).get('questions', [])
+                        S['responses'] = ed.get('/lessons/slides/%s/questions/responses' % s['id']).get('responses', [])
+                    if s['type'] == 'code' and S['detail'].get('challenge_id'):
+                        S['challenge'] = ed.get('/challenges/%s?view=1' % S['detail']['challenge_id']).get('challenge')
+                except Exception as e:
+                    dump['errors'].append({'slide': s['id'], 'title': s['title'], 'error': str(e)})
+                les['slides'].append(S)
+            G['lessons'].append(les)
+        dump['modules'].append(G)
+
+    raw = os.path.join(a.out, '_raw'); os.makedirs(raw, exist_ok=True)
+    json.dump(dump, open(os.path.join(raw, 'ed_dump.json'), 'w', encoding='utf-8'), indent=1)
+    n = sum(len(l['slides']) for g in dump['modules'] for l in g['lessons'])
+    log('\nfetched %d modules, %d slides, %d errors' % (len(dump['modules']), n, len(dump['errors'])))
+
+
+def progress(done, total, label=''):
+    total = max(total, done, 1)
+    bar = '#' * int(30 * done / total) + '.' * (30 - int(30 * done / total))
+    label = (label[:40] + '...') if len(label) > 43 else label
+    sys.stdout.write('\r    [%s] %3d/%-3d %-45s' % (bar, done, total, label))
+    sys.stdout.flush()
+    if done >= total: sys.stdout.write('\n')
+
+
+# ----------------------------------------------------------------------------- Ed XML -> Markdown
+def ed_inline(node):
+    out = []
+    for c in node.children:
+        if isinstance(c, NavigableString):
+            out.append(str(c)); continue
+        if not isinstance(c, Tag): continue
+        n = c.name
+        if n == 'edlink':
+            t = ed_inline(c).strip() or c.get('href', ''); out.append('[%s](%s)' % (t, c.get('href', '')))
+        elif n == 'bold': out.append('**' + ed_inline(c).strip() + '**')
+        elif n == 'italic': out.append('*' + ed_inline(c).strip() + '*')
+        elif n == 'strike': out.append('~~' + ed_inline(c) + '~~')
+        elif n == 'code': out.append('`' + c.get_text() + '`')
+        elif n == 'break': out.append('  \n')
+        elif n == 'math': out.append('$' + c.get_text() + '$')
+        elif n == 'image': out.append('![%s](%s)' % (c.get('alt', ''), c.get('src', '')))
+        else: out.append(ed_inline(c))
+    return ''.join(out)
+
+BLOCK_TAGS = {'paragraph', 'heading', 'snippet', 'pre', 'code-block', 'list', 'callout', 'table', 'figure',
+              'file', 'video', 'embed', 'iframe', 'youtube', 'web-snippet', 'spoiler', 'details', 'image'}
+
+def has_block_children(node):
+    return any(isinstance(c, Tag) and c.name in BLOCK_TAGS for c in node.children)
+
+import html as _html
+def web_snippet_to_md(node):
+    """Ed 'web snippet' blocks hold raw HTML (usually a video iframe). Keep the URLs, drop the markup."""
+    raw = _html.unescape(node.get_text())
+    urls = re.findall(r'(?:src|href)=["\']([^"\']+)["\']', raw)
+    if urls:
+        return ''.join('Embedded media: %s\n\n' % _html.unescape(u) for u in urls)
+    txt = BeautifulSoup(raw, 'html.parser').get_text(' ').strip()
+    return (txt + '\n\n') if txt else ''
+
+def ed_block(node, depth=0):
+    out = []
+    # a container whose children are only text and inline tags is really one paragraph
+    if not has_block_children(node) and any(isinstance(c, Tag) for c in node.children):
+        return ed_inline(node).strip() + '\n\n'
+    for c in node.children:
+        if isinstance(c, NavigableString):
+            if c.strip(): out.append(c.strip() + '\n\n')
+            continue
+        n = c.name
+        if n == 'paragraph': out.append(ed_inline(c).strip() + '\n\n')
+        elif n == 'web-snippet': out.append(web_snippet_to_md(c))
+        elif n in ('snippet', 'pre', 'code-block') and c.find('snippet-file'):
+            for f in c.find_all('snippet-file'):
+                if f.get_text().strip():
+                    out.append('```%s\n%s\n```\n\n' % (f.get('language', '') or '', f.get_text().rstrip()))
+        elif n == 'heading':
+            out.append('#' * min(int(c.get('level', 2)) + 1, 6) + ' ' + ed_inline(c).strip() + '\n\n')
+        elif n in ('snippet', 'pre', 'code-block'):
+            body = '\n'.join(l.get_text() for l in c.find_all('snippet-line')) if c.find('snippet-line') else c.get_text()
+            out.append('```%s\n%s\n```\n\n' % (c.get('language', '') or '', body.rstrip()))
+        elif n == 'list':
+            num = c.get('style', 'bullet') == 'number'
+            for k, it in enumerate(c.find_all('list-item', recursive=False), 1):
+                lines = ed_block(it, depth + 1).strip().split('\n')
+                out.append('  ' * depth + ('%d.' % k if num else '-') + ' ' + lines[0] + '\n')
+                for ln in lines[1:]: out.append(('  ' * depth + '  ' + ln if ln.strip() else '') + '\n')
+            out.append('\n')
+        elif n == 'callout':
+            out.append('> **%s**\n> %s\n\n' % (c.get('type', 'info').upper(), ed_block(c).strip().replace('\n', '\n> ')))
+        elif n == 'table':
+            for i, r in enumerate(c.find_all('table-row')):
+                cells = [ed_block(x).strip().replace('\n', ' ') for x in r.find_all('table-cell')]
+                out.append('| ' + ' | '.join(cells) + ' |\n')
+                if i == 0: out.append('|' + '---|' * len(cells) + '\n')
+            out.append('\n')
+        elif n in ('image', 'figure'):
+            img = c if n == 'image' else (c.find('image') or c)
+            out.append('![%s](%s)\n\n' % (img.get('alt', ''), img.get('src', '')))
+            cap = c.find('caption') if n == 'figure' else None
+            if cap: out.append('*' + ed_inline(cap).strip() + '*\n\n')
+        elif n == 'file':
+            out.append('Attachment: [%s](%s)\n\n' % (c.get('name') or c.get('href'), c.get('href') or c.get('url', '')))
+        elif n in ('video', 'embed', 'iframe', 'youtube'):
+            out.append('Embedded media: %s\n\n' % (c.get('src') or c.get('href') or c.get('id', '')))
+        elif n == 'break': out.append('\n')
+        else:
+            inner = ed_block(c, depth)
+            out.append(inner if inner.strip() else ed_inline(c) + '\n\n')
+    return ''.join(out)
+
+def ed_to_md(xml, img_sink=None):
+    if not xml: return ''
+    xml = re.sub(r'<link(\s|>)', r'<edlink\1', xml).replace('</link>', '</edlink>')
+    soup = BeautifulSoup(xml, 'html.parser')
+    txt = ed_block(soup.find('document') or soup)
+    txt = re.sub(r'\n{3,}', '\n\n', txt).strip() + '\n'
+    return img_sink(txt) if img_sink else txt
+
+
+# ----------------------------------------------------------------------------- builder
+class Builder:
+    def __init__(self, out):
+        self.out = out
+        self.raw = os.path.join(out, '_raw')
+        self.dump = json.load(open(os.path.join(self.raw, 'ed_dump.json'), encoding='utf-8'))
+        self.cache = Cache(os.path.join(self.raw, 'cache'))
+        self.stats = {'slides': 0, 'written': 0, 'failed': [], 'external': [], 'webpages': []}
+
+    # images referenced from Ed documents/quizzes live on static.*.edusercontent.com
+    def localise_images(self, text, img_dir):
+        def repl(m):
+            url = m.group(2)
+            try:
+                data = self.cache.get(url)
+                ext = {b'\x89PNG': '.png', b'\xff\xd8\xff': '.jpg', b'GIF8': '.gif', b'RIFF': '.webp'}.get(data[:4], '') or \
+                      ('.jpg' if data[:3] == b'\xff\xd8\xff' else '') or ('.svg' if b'<svg' in data[:300] else '')
+                fn = 'ed-' + os.path.basename(urlparse(url).path) + ext
+                os.makedirs(img_dir, exist_ok=True)
+                open(os.path.join(img_dir, fn), 'wb').write(data)
+                return '![%s](images/%s)' % (m.group(1), fn)
+            except Exception:
+                return m.group(0)
+        return re.sub(r'!\[([^\]]*)\]\((https://static\.[a-z.]*edusercontent\.com/[^)\s]+)\)', repl, text)
+
+    def webpage(self, url, img_dir):
+        raw = self.cache.get(url).decode('utf-8', 'replace')
+        soup = BeautifulSoup(raw, 'html.parser')
+        for t in soup(['script', 'style', 'nav', 'noscript', 'header', 'footer']): t.decompose()
+        body = soup.find('main') or soup.find('article') or soup.find(class_='page') or soup.body or soup
+        plain_words = len(body.get_text(' ').split())
+        for pre in body.find_all('pre'):
+            text = pre.get_text(); code = pre.find('code'); lang = ''
+            if code:
+                m = re.search(r'language-(\w+)', ' '.join(code.get('class', []))); lang = m.group(1) if m else ''
+            pre.clear(); pre.string = text; pre['data-lang'] = lang
+        for div in body.find_all(class_=re.compile(r'callout|admonition|note|warning', re.I)):
+            if div.name == 'div': div.name = 'blockquote'
+        for img in body.find_all('img'):
+            src = img.get('src')
+            if not src: continue
+            full = urljoin(url, src)
+            try:
+                data = self.cache.get(full)
+                fn = safe(os.path.basename(urlparse(full).path)) or 'image'
+                os.makedirs(img_dir, exist_ok=True)
+                open(os.path.join(img_dir, fn), 'wb').write(data)
+                img['src'] = 'images/' + fn
+            except Exception:
+                img['src'] = full
+        for fr in body.find_all(['iframe', 'video', 'source']):
+            src = urljoin(url, fr.get('src')) if fr.get('src') else '(unknown)'
+            self.stats['external'].append(src)
+            fr.replace_with(soup.new_string('\n\nEmbedded media: %s\n\n' % src))
+        for a in body.find_all('a', href=True): a['href'] = urljoin(url, a['href'])
+        text = md(str(body), heading_style='ATX', bullets='-',
+                  code_language_callback=lambda el: el.get('data-lang', '') if el else '')
+        text = re.sub(r'\n{3,}', '\n\n', text).strip() + '\n'
+        md_words = len(re.sub(r'[#*`>|_\-]', ' ', text).split())
+        self.stats['webpages'].append((url, plain_words, md_words))
+        return '<!-- source: %s -->\n\n%s' % (url, text)
+
+    def quiz(self, s, img_dir):
+        """Render every Ed question type. The answer comes from, in order of preference:
+        the course-released solution, or the student's own response marked correct."""
+        sink = lambda t: self.localise_images(t, img_dir)
+        doc = lambda x: ed_to_md(x, sink).strip() if isinstance(x, str) and x.startswith('<document') else str(x if x is not None else '').strip()
+        L = lambda k: chr(65 + k)
+        out = ['# ' + s['title'], '', '_Quiz mode: %s_' % s['detail'].get('mode'), '']
+        resp = {r['question_id']: r for r in s.get('responses', [])}
+        qs = sorted(s.get('questions', []), key=lambda q: q.get('index', 0))
+        known = 0
+        body = []
+        for i, q in enumerate(qs, 1):
+            d = q['data']; t = d.get('type'); r = resp.get(q['id']); rd = r.get('data') if r else None
+            sol = d.get('solution')
+            body += ['', '## Question %d' % i + ('  (%s)' % t if t not in ('multiple-choice',) else ''), '', doc(d.get('content', ''))]
+            answer_line = None
+            if t == 'multiple-choice':
+                chosen = set(rd) if isinstance(rd, list) else set()
+                correct = set(sol) if isinstance(sol, list) else (chosen if r and r.get('correct') else set())
+                for k, ans in enumerate(d.get('answers', [])):
+                    mark = ''
+                    if k in correct: mark = '  <-- CORRECT'
+                    elif k in chosen: mark = '  <-- your answer, marked wrong'
+                    body.append('- **%s.** %s%s' % (L(k), doc(ans).replace('\n', ' '), mark))
+                if correct:
+                    src = 'course-released solution' if isinstance(sol, list) else 'confirmed correct on Ed'
+                    answer_line = '**Answer: %s** (%s)' % (', '.join(L(k) for k in sorted(correct)), src)
+                    if d.get('multiple_selection'): answer_line += '  _(select all that apply)_'
+            elif t == 'true-false':
+                if isinstance(sol, bool): answer_line = '**Answer: %s** (course-released solution)' % ('True' if sol else 'False')
+                elif r and r.get('correct') and isinstance(rd, bool): answer_line = '**Answer: %s** (confirmed correct on Ed)' % ('True' if rd else 'False')
+                if isinstance(rd, bool): body.append('_Your answer: %s_' % ('True' if rd else 'False'))
+            elif t == 'reorder':
+                items = d.get('items', [])
+                body.append('Items (as shown):'); body += ['- %s' % doc(x) for x in items]
+                if isinstance(sol, list):
+                    answer_line = '**Correct order:** ' + ' > '.join(doc(items[k]) for k in sol if k < len(items)) + ' (course-released solution)'
+                elif isinstance(rd, list) and r.get('correct'):
+                    answer_line = '**Correct order:** ' + ' > '.join(doc(items[k]) for k in rd if k < len(items)) + ' (confirmed correct on Ed)'
+            elif t == 'short-answer':
+                if sol: answer_line = '**Answer:** %s (course-released solution)' % doc(sol)
+                if rd: body.append('_Your answer: %s_' % doc(rd if isinstance(rd, str) else json.dumps(rd)))
+            elif t == 'general':   # free-text / discussion question
+                if isinstance(rd, dict) and rd.get('content'): body += ['', '**Your answer:**', '', doc(rd['content'])]
+                if sol: answer_line = '**Model answer:**\n\n' + doc(sol)
+            else:
+                body.append('_Unsupported question type "%s"; raw data:_\n\n```json\n%s\n```' % (t, json.dumps(d, indent=1)[:2000]))
+            if answer_line:
+                known += 1; body += ['', answer_line]
+            elif t in ('short-answer', 'general') and not d.get('assessed'):
+                known += 1; body += ['', '_Open question, not assessed._']
+            else:
+                body += ['', '**Status:** answer not known yet (not answered, or answered wrong).']
+            if d.get('explanation') and doc(d['explanation']): body += ['', '**Explanation:** ' + doc(d['explanation'])]
+        out.append('_%d of %d questions have a known answer._\n' % (known, len(qs)))
+        return '\n'.join(out + body) + '\n'
+
+    def code(self, s, img_dir):
+        sink = lambda t: self.localise_images(t, img_dir)
+        c = s.get('challenge') or {}
+        out = ['# ' + s['title'], '', '_Ed code challenge, type: %s, language: %s_' % (c.get('type') or '-', c.get('language') or '-'), '']
+        a = ed_to_md(s['detail'].get('content') or '', sink); b = ed_to_md(c.get('content') or '', sink)
+        if a.strip(): out.append(a)
+        if b.strip() and b.strip() != a.strip(): out += ['## Challenge description', '', b]
+        if c.get('explanation'): out += ['## Explanation', '', ed_to_md(c['explanation'], sink)]
+        if not (a.strip() or b.strip()): out.append('_No written description; interactive workspace only._')
+        return '\n'.join(out) + '\n'
+
+    def pdf_to_md(self, path, title):
+        doc = pymupdf.open(path)
+        out = ['# ' + title, '', '_Converted from PDF (%d pages)_' % len(doc), '']
+        for i, page in enumerate(doc, 1):
+            t = re.sub(r'\n{3,}', '\n\n', re.sub(r'[ \t]+\n', '\n', page.get_text('text').strip()))
+            out += ['## Page %d' % i, '', t or '_(no extractable text on this page; see the PDF)_', '']
+        return '\n'.join(out)
+
+    def build(self):
+        index = ['# %s - Ed Lessons offline archive' % self.dump.get('course', ''), '', '_Exported %s_' % self.dump.get('fetched_at', '')]
+        for g in self.dump['modules']:
+            gdir = os.path.join(self.out, safe(g['name'])); os.makedirs(gdir, exist_ok=True)
+            index += ['', '## ' + g['name']]
+            for l in g['lessons']:
+                ldir = os.path.join(gdir, safe(l['title'])); os.makedirs(ldir, exist_ok=True)
+                img_dir = os.path.join(ldir, 'images')
+                index += ['', '### ' + l['title'], '']
+                lidx = ['# ' + l['title'], '', '_%s_' % g['name'], '']
+                for n, s in enumerate(l['slides'], 1):
+                    self.stats['slides'] += 1
+                    base = '%02d - %s' % (n, safe(s['title'])); det = s.get('detail') or {}
+                    try:
+                        if s['type'] == 'webpage':
+                            fn = base + '.md'; text = self.webpage(det['url'], img_dir)
+                        elif s['type'] == 'pdf':
+                            fn = base + '.pdf'
+                            open(os.path.join(ldir, fn), 'wb').write(self.cache.get(det['file_url']))
+                            open(os.path.join(ldir, base + '.md'), 'w', encoding='utf-8').write(self.pdf_to_md(os.path.join(ldir, fn), s['title']))
+                            text = None
+                        elif s['type'] == 'document':
+                            fn = base + '.md'; text = '# %s\n\n%s' % (s['title'], ed_to_md(det.get('content', ''), lambda t: self.localise_images(t, img_dir)))
+                            self.stats['external'] += re.findall(r'https?://[^\s)>\]]+', text)
+                        elif s['type'] == 'quiz':
+                            fn = base + '.md'; text = self.quiz(s, img_dir)
+                        elif s['type'] == 'code':
+                            fn = base + '.md'; text = self.code(s, img_dir)
+                        elif s['type'] == 'video':
+                            fn = base + '.md'; text = '# %s\n\nVideo: %s\n' % (s['title'], det.get('url') or det.get('file_url') or json.dumps(det)[:300])
+                        else:
+                            fn = base + '.md'; text = '# %s\n\n_Unsupported slide type "%s"; raw data below._\n\n```json\n%s\n```\n' % (s['title'], s['type'], json.dumps(det, indent=1)[:4000])
+                        if text is not None:
+                            open(os.path.join(ldir, fn), 'w', encoding='utf-8').write(text)
+                        self.stats['written'] += 1
+                    except Exception as e:
+                        fn = base + ' (FAILED).md'
+                        open(os.path.join(ldir, fn), 'w', encoding='utf-8').write('# %s\n\nFailed: %s\n' % (s['title'], e))
+                        self.stats['failed'].append((l['title'], s['title'], str(e)))
+                    lidx.append('- [%s](<%s>)' % (s['title'], fn))
+                    index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), fn))
+                open(os.path.join(ldir, 'README.md'), 'w', encoding='utf-8').write('\n'.join(lidx) + '\n')
+        open(os.path.join(self.out, 'README.md'), 'w', encoding='utf-8').write('\n'.join(index) + '\n')
+        json.dump(self.stats, open(os.path.join(self.raw, 'build_stats.json'), 'w'), indent=1)
+        log('built %d/%d slides, %d failed -> %s' % (self.stats['written'], self.stats['slides'], len(self.stats['failed']), self.out))
+
+
+def cmd_build(a):
+    Builder(a.out).build()
+
+
+# ----------------------------------------------------------------------------- NotebookLM pack
+def cmd_nblm(a):
+    root = a.out; up = os.path.join(root, 'NotebookLM upload'); os.makedirs(up, exist_ok=True)
+    dump = json.load(open(os.path.join(root, '_raw', 'ed_dump.json'), encoding='utf-8'))
+    npdf = nmd = nfig = 0
+    for g in dump['modules']:
+        gdir = os.path.join(root, safe(g['name']))
+        wk = g.get('week') or (int(re.search(r'week\s*(\d+)', g['name'], re.I).group(1)) if re.search(r'week\s*(\d+)', g['name'], re.I) else None)
+        tag = 'W%02d' % wk if wk else safe(g['name'])[:20]
+        parts = ['# ' + g['name'], '', '_Merged text of all readings, notes, code challenges and quizzes. PDFs are uploaded separately._', '']
+        figures = []
+        for l in g['lessons']:
+            ldir = os.path.join(gdir, safe(l['title']))
+            if not os.path.isdir(ldir): continue
+            parts += ['', '---', '', '# ' + l['title'], '']
+            for fn in sorted(os.listdir(ldir)):
+                p = os.path.join(ldir, fn)
+                if fn.lower().endswith('.pdf'):
+                    dst = '%s %s - %s' % (tag, safe(l['title']), fn.split(' - ', 1)[-1])
+                    open(os.path.join(up, dst), 'wb').write(open(p, 'rb').read()); npdf += 1
+                    parts += ['_(PDF uploaded separately: %s)_' % dst, '']
+                    continue
+                if not fn.endswith('.md') or fn == 'README.md' or fn[:-3] + '.pdf' in os.listdir(ldir): continue
+                body = open(p, encoding='utf-8').read()
+                body = re.sub(r'^<!-- source:.*?-->\n*', '', body)
+                for m in re.finditer(r'!\[([^\]]*)\]\((images/[^)]+)\)', body):
+                    hs = re.findall(r'^#{1,6} (.+)$', body[:m.start()], flags=re.M)
+                    figures.append((l['title'], fn.split(' - ', 1)[-1][:-3], hs[-1].strip() if hs else '', m.group(1), os.path.join(ldir, m.group(2))))
+                body = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', body)
+                body = re.sub(r'^(#{1,5}) ', lambda m: '#' * (len(m.group(1)) + 1) + ' ', body, flags=re.M)
+                parts += ['## ' + fn.split(' - ', 1)[-1][:-3], '', body.strip(), '']
+        open(os.path.join(up, '%s - %s.md' % (tag, safe(g['name']).split(' - ', 1)[-1])), 'w', encoding='utf-8').write('\n'.join(parts) + '\n'); nmd += 1
+        if figures:
+            doc = pymupdf.open(); W, H, M = 595, 842, 40
+            for i, (lesson, section, heading, alt, path) in enumerate(figures, 1):
+                page = doc.new_page(width=W, height=H); y = M
+                page.insert_text((M, y + 12), '%s  -  %s' % (g['name'], lesson), fontsize=9, color=(0.4, 0.4, 0.4)); y += 22
+                page.insert_text((M, y + 14), 'Figure %d: %s' % (i, section), fontsize=13); y += 24
+                if heading and heading != section:
+                    page.insert_text((M, y + 11), 'Section: ' + heading, fontsize=10, color=(0.3, 0.3, 0.3)); y += 18
+                y += 6
+                try:
+                    pix = pymupdf.Pixmap(path); s = min((W - 2 * M) / pix.width, (H - y - M - 90) / pix.height, 1.5)
+                    rect = pymupdf.Rect(M, y, M + pix.width * s, y + pix.height * s); page.insert_image(rect, filename=path); y = rect.y1 + 14
+                except Exception:
+                    page.insert_text((M, y + 11), '[image could not be embedded: %s]' % os.path.basename(path), fontsize=10); y += 20
+                page.insert_textbox(pymupdf.Rect(M, y, W - M, H - M), 'Caption / alt text: ' + (alt or '(none given)'), fontsize=10.5)
+            doc.save(os.path.join(up, '%s - Figures and images.pdf' % tag)); doc.close(); nfig += 1
+    log('NotebookLM upload folder: %d merged .md, %d PDFs, %d figure PDFs -> %s' % (nmd, npdf, nfig, up))
+
+
+# ----------------------------------------------------------------------------- audit
+def cmd_audit(a):
+    root = a.out; raw = os.path.join(root, '_raw')
+    dump = json.load(open(os.path.join(raw, 'ed_dump.json'), encoding='utf-8'))
+    stats = json.load(open(os.path.join(raw, 'build_stats.json'))) if os.path.exists(os.path.join(raw, 'build_stats.json')) else {}
+    problems = []
+    expected = sum(len(l['slides']) for g in dump['modules'] for l in g['lessons'])
+    files = pdfs = pdf_pages = pdf_blank = quiz_q = quiz_ok = quiz_none = imgs_missing = short = 0
+    for g in dump['modules']:
+        for l in g['lessons']:
+            ldir = os.path.join(root, safe(g['name']), safe(l['title']))
+            if not os.path.isdir(ldir):
+                problems.append('missing lesson folder: ' + ldir); continue
+            for fn in os.listdir(ldir):
+                p = os.path.join(ldir, fn)
+                if fn == 'README.md' or os.path.isdir(p): continue
+                files += 1
+                if 'FAILED' in fn: problems.append('failed slide: ' + p)
+                if fn.endswith('.pdf'):
+                    pdfs += 1; d = pymupdf.open(p); pdf_pages += len(d)
+                    blank = sum(1 for pg in d if not pg.get_text('text').strip())
+                    pdf_blank += blank
+                    if blank == len(d): problems.append('PDF has no text on any page (scanned?): ' + p)
+                elif fn.endswith('.md'):
+                    t = open(p, encoding='utf-8').read()
+                    if len(t.split()) < 30 and not fn[:-3] + '.pdf' in os.listdir(ldir):
+                        short += 1; problems.append('very short file (%d words): %s' % (len(t.split()), p))
+                    for m in re.finditer(r'!\[[^\]]*\]\((images/[^)]+)\)', t):
+                        if not os.path.exists(os.path.join(ldir, m.group(1))):
+                            imgs_missing += 1; problems.append('image link broken: %s -> %s' % (p, m.group(1)))
+            for s in l['slides']:
+                if s['type'] == 'quiz':
+                    resp = {r['question_id']: r for r in s.get('responses', [])}
+                    for q in s.get('questions', []):
+                        quiz_q += 1
+                        d = q['data']
+                        if d.get('solution') not in (None, '', []) or (q['id'] in resp and resp[q['id']].get('correct')) \
+                                or (d.get('type') in ('short-answer', 'general') and not d.get('assessed')):
+                            quiz_ok += 1
+                        elif q['id'] not in resp: quiz_none += 1
+    low = [(u, pw, mw) for u, pw, mw in stats.get('webpages', []) if pw and mw / pw < 0.7]
+    for u, pw, mw in low: problems.append('webpage lost text in conversion (%d -> %d words): %s' % (pw, mw, u))
+    print('\n=== edpack audit ===')
+    print('slides in Ed API      : %d' % expected)
+    print('slides written        : %d   (failed: %d)' % (stats.get('written', 0), len(stats.get('failed', []))))
+    print('files on disk         : %d' % files)
+    print('PDFs                  : %d  (%d pages, %d without text)' % (pdfs, pdf_pages, pdf_blank))
+    print('reading pages         : %d  (text kept, median ratio %.2f)' % (len(stats.get('webpages', [])), _median([mw / pw for _, pw, mw in stats.get('webpages', []) if pw]) if stats.get('webpages') else 0))
+    print('quiz questions        : %d  (%d confirmed correct, %d unanswered)' % (quiz_q, quiz_ok, quiz_none))
+    print('fetch errors          : %d' % len(dump.get('errors', [])))
+    print('external links noted  : %d' % len(set(stats.get('external', []))))
+    print('problems              : %d' % len(problems))
+    for p in problems: print('  ! ' + p)
+    if not problems: print('  none - archive is complete and consistent')
+
+def _median(xs):
+    xs = sorted(xs); n = len(xs)
+    return 0 if not n else (xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2)
+
+
+# ----------------------------------------------------------------------------- setup / run
+def cmd_setup(a):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    cfg = load_config()
+    print('Create a token at https://edstem.org/au/settings/api-tokens (change "au" to your region).')
+    t = input('Paste your Ed API token: ').strip()
+    if t: cfg['token'] = t
+    json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'))
+    print('saved to', CONFIG)
+
+def cmd_run(a):
+    cmd_fetch(a); cmd_build(a); cmd_nblm(a); cmd_audit(a)
+
+
+def ask(prompt, default=None):
+    s = input('%s%s: ' % (prompt, (' [%s]' % default) if default is not None else '')).strip()
+    return s or (default if default is not None else '')
+
+def remember_location(path):
+    cfg = load_config()
+    recent = [p for p in cfg.get('recent', []) if os.path.normcase(p) != os.path.normcase(path)]
+    cfg['recent'] = [path] + recent[:4]
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'))
+
+def choose_location():
+    home = os.path.expanduser('~')
+    recent = [p for p in load_config().get('recent', []) if os.path.isdir(p)]
+    standard = [os.path.join(home, d) for d in ('Documents', 'Desktop', 'Downloads') if os.path.isdir(os.path.join(home, d))]
+    options = []
+    for p in recent + standard + [os.getcwd()]:
+        if all(os.path.normcase(p) != os.path.normcase(o) for _, o in options):
+            options.append(('recent' if p in recent else ('current folder' if p == os.getcwd() else ''), p))
+    print('\n  Save it inside which folder?')
+    for i, (tag, p) in enumerate(options, 1):
+        print('   %2d. %s%s' % (i, p, ('   (%s)' % tag) if tag else ''))
+    print('    or type any folder path')
+    while True:
+        s = ask('  Choice', '1')
+        if s.isdigit() and 1 <= int(s) <= len(options):
+            return options[int(s) - 1][1]
+        p = os.path.abspath(os.path.expanduser(s.strip('"')))
+        if os.path.isdir(p):
+            return p
+        if os.path.isdir(os.path.dirname(p)):
+            if ask('  %s does not exist. Create it? (y/n)' % p, 'y').lower() in ('y', 'yes'):
+                os.makedirs(p); return p
+        else:
+            print('  That folder was not found. Type a number from the list or a full path.')
+
+def wizard():
+    """Interactive mode: runs when edpack is started with no arguments."""
+    print('\n  edpack  -  Ed Lessons -> offline folder + NotebookLM pack')
+    print('  No AI involved. Everything is fetched from the Ed API and converted locally.\n')
+    if not (os.environ.get('ED_TOKEN') or load_config().get('token')):
+        print('  First time: you need an Ed API token.')
+        cmd_setup(None); print()
+    ed = Ed(token())
+    print('  Loading your courses...')
+    me = ed.get('/user')
+    courses = [c['course'] for c in me.get('courses', [])]
+    courses.sort(key=lambda c: (str(c.get('year', '')), str(c.get('session', '')), c.get('code', '')), reverse=True)
+    if not courses:
+        sys.exit('  No courses found on this Ed account.')
+    last = None
+    while True:
+        last = archive_one(ed, courses)
+        print('\n  What next?')
+        print('    1. Archive another course or week')
+        if last: print('    2. Open the last archive folder again')
+        print('    q. Quit')
+        while True:
+            s = ask('  Choice', 'q').lower()
+            if s in ('q', 'quit', 'exit'): print('  Bye.'); return
+            if s == '1': break
+            if s == '2' and last and sys.platform == 'win32': os.startfile(last); continue
+            print('  Type 1, 2 or q.')
+
+def archive_one(ed, courses):
+    """One pass of the wizard: pick course, weeks, location; run; return the output folder."""
+    print('\n  Which course?')
+    for i, c in enumerate(courses, 1):
+        print('   %2d. %s  %s  (%s %s)' % (i, c.get('code', ''), c.get('name', ''), c.get('year', ''), c.get('session', '')))
+    while True:
+        pick = ask('  Number', '1')
+        if not (pick.isdigit() and 1 <= int(pick) <= len(courses)):
+            print('  Please type a number from the list.'); continue
+        course = courses[int(pick) - 1]
+        L = ed.get('/courses/%s/lessons' % course['id'])
+        if L.get('lessons'): break
+        print('  %s has no Ed Lessons (it may only use Ed for discussion). Pick another course.' % course.get('code'))
+    weeks_avail = sorted({int(m.group(1)) for mod in L.get('modules', []) for m in [re.search(r'week\s*(\d+)', mod['name'], re.I)] if m})
+    print('\n  %s has %d lessons in %d modules.' % (course.get('code'), len(L.get('lessons', [])), len(L.get('modules', []))))
+    if weeks_avail:
+        print('  Weeks available: %s' % ', '.join(str(w) for w in weeks_avail))
+        weeks = ask('  Which weeks? (e.g. 1  or  1-8  or  1,3,5  or  all)', 'all')
+        weeks = None if weeks.lower() == 'all' else weeks
+    else:
+        print('  Modules are not named by week, so everything will be archived.'); weeks = None
+
+    default_name = safe(course.get('code') or ('ed-%s' % course['id']))
+    name = ask('\n  Folder name for the archive', default_name)
+    where = choose_location()
+    out = os.path.join(where, safe(name))
+    remember_location(where)
+    print('\n  Archive will be written to:\n    %s\n' % out)
+    if ask('  Start? (y/n)', 'y').lower() not in ('y', 'yes'):
+        print('  Cancelled.'); return None
+
+    a = argparse.Namespace(course=str(course['id']), weeks=weeks, out=out)
+    t0 = time.time()
+    print('\n== 1/4 Downloading from Ed'); cmd_fetch(a)
+    print('\n== 2/4 Converting to Markdown and collecting PDFs'); cmd_build(a)
+    print('\n== 3/4 Building the NotebookLM upload folder'); cmd_nblm(a)
+    print('\n== 4/4 Checking the result'); cmd_audit(a)
+    print('\n  Done in %d seconds.' % (time.time() - t0))
+    print('  Archive:            %s' % out)
+    print('  NotebookLM upload:  %s' % os.path.join(out, 'NotebookLM upload'))
+    print('  Drag everything in that upload folder into NotebookLM > Add sources > Upload files.\n')
+    if sys.platform == 'win32' and ask('  Open the folder now? (y/n)', 'y').lower() in ('y', 'yes'):
+        os.startfile(out)
+    return out
+
+
+def main():
+    if len(sys.argv) == 1:
+        try:
+            wizard()
+        except KeyboardInterrupt:
+            print('\n  Cancelled.')
+        return
+    p = argparse.ArgumentParser(prog='edpack', description='Archive Ed Lessons offline, NotebookLM-ready. No AI involved. Run with no arguments for the interactive mode.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    for name, fn, needs in [('setup', cmd_setup, False), ('fetch', cmd_fetch, True), ('build', cmd_build, True),
+                            ('nblm', cmd_nblm, True), ('audit', cmd_audit, True), ('run', cmd_run, True)]:
+        sp = sub.add_parser(name); sp.set_defaults(fn=fn)
+        if needs:
+            sp.add_argument('--course', required=name in ('fetch', 'run'), help='Ed course id, e.g. 20603')
+            sp.add_argument('--weeks', help='e.g. 1  or  1-8  or  1,3,5   (default: all)')
+            sp.add_argument('--out', help='output folder (default: ./ed-<course>)')
+    a = p.parse_args()
+    if getattr(a, 'course', None) is None and getattr(a, 'out', None):
+        pass
+    if hasattr(a, 'out') and not a.out:
+        a.out = os.path.abspath('ed-%s' % a.course) if getattr(a, 'course', None) else sys.exit('--out or --course required')
+    a.fn(a)
+
+if __name__ == '__main__':
+    main()
