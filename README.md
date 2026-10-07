@@ -10,7 +10,6 @@ Built by a Monash student, for Monash students, because when you are on a time c
 
 ```
 FIT2109/
-├── README.md                                 index of everything
 ├── Week 1 - Introduction to the Shell/
 │   ├── W1 Pre-Class - .../
 │   │   ├── 01 - 1.1 - History and Context.md
@@ -111,7 +110,7 @@ edpack
 
 It lists your units, asks which weeks you want and which folder is that unit's archive (pick one from the list or paste any path), then shows a progress bar and finishes with the audit report and the two paths you need. It stays open afterwards so you can archive another unit or reopen the folder.
 
-The week folders are named by Ed (e.g. `Week 9 - Debugging - Systematic Bug Hunting`) and go straight into the folder you picked. Run it again later with the next week and the same folder: the new week is added alongside the old ones, and the index, NotebookLM upload and audit cover every week in the folder. Picking a week you already have refreshes it so it matches Ed exactly: new slides are added, a renamed week or lesson has its folder renamed (your own files inside come along), and anything Ed no longer has is moved to `_raw/replaced/<date>/` rather than deleted. Files you add yourself are never touched. edpack remembers the folder per unit and offers it first next time.
+The week folders are named by Ed (e.g. `Week 9 - Debugging - Systematic Bug Hunting`) and go straight into the folder you picked. Run it again later with the next week and the same folder: the new week is added alongside the old ones, and the NotebookLM upload and audit cover every week in the folder. Picking a week you already have refreshes it so it matches Ed exactly: new slides are added, a renamed week or lesson has its folder renamed (your own files inside come along), and anything Ed no longer has is moved to `_raw/replaced/<date>/` rather than deleted. Files you add yourself are never touched. edpack remembers the folder per unit and offers it first next time.
 
 ### Scripted
 
@@ -137,9 +136,21 @@ Monash has Moodle's app API switched off, so there is no permanent token like Ed
 3. Click the Moodle site, find the row named `MoodleSession` and copy its **Value**.
 4. Paste it when edpack asks. Press Enter instead to skip.
 
-The value is used only for that run and never written to disk. It stops working when you log out of Moodle or the session times out; edpack tells you when that happens. Files already downloaded are skipped next time, except in weeks you pick again: those are re-checked, and if the lecturer replaced a file the new one is saved and the old one moved to `_raw/replaced/`. For scripted runs, set the `MOODLE_SESSION` environment variable instead.
+edpack saves the value in `~/.edpack/config.json` next to your Ed token and reuses it, so you only paste it again once Moodle has ended that session (you logged out, or it timed out). edpack checks it at the start of each run and asks for a fresh one when it has expired. Files already downloaded are skipped next time, except in weeks you pick again: those are re-checked, and if the lecturer replaced a file the new one is saved and the old one moved to `_raw/replaced/`. For scripted runs, set the `MOODLE_SESSION` environment variable instead.
 
-Treat that value like a password while you have it: anyone holding it is logged in to Moodle as you.
+Treat that value like a password: until the session ends, anyone holding it is logged in to Moodle as you. Logging out of Moodle in your browser ends it immediately.
+
+#### Skip the copying: let Chrome hand it over
+
+Chrome and Edge encrypt their cookie files, so edpack cannot read the session from disk. Instead, a tiny extension that can see only the Moodle site passes it to edpack whenever you log in, through Chrome's official native messaging channel. One-time setup per computer:
+
+```bash
+edpack moodle-setup
+```
+
+Then in Chrome open `chrome://extensions` (Edge: `edge://extensions`), turn on **Developer mode**, click **Load unpacked** and choose the folder edpack printed (`~/.edpack/chrome-extension`). Open Moodle once and log in as usual.
+
+From then on, being logged in to Moodle in Chrome is enough. When the session has ended, edpack asks you to open Moodle in Chrome and press Enter; nothing to copy. The extension is about ten lines of JavaScript (written to that folder, readable before you load it) and asks only for the `cookies` and `nativeMessaging` permissions on your Moodle site. Other universities: `edpack moodle-setup --host your.moodle.site`. To undo: `edpack moodle-setup --remove`, then remove the extension in Chrome.
 
 ### Uploading to NotebookLM
 

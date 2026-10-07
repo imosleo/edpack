@@ -103,7 +103,7 @@ def check_weeks(weeks, available):
 class Ed:
     def __init__(self, tok):
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.4.1'})
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.5'})
 
     def get(self, path, **kw):
         for attempt in range(3):
@@ -193,7 +193,7 @@ def cmd_fetch(a):
     log('\nfetched %d modules, %d slides, %d errors' % (len(dump['modules']), n, len(dump['errors'])))
 
     # Add to an existing archive of the same course instead of replacing it, so fetching
-    # week 9 into a folder that already has weeks 1-8 keeps all nine in the index and NotebookLM pack.
+    # week 9 into a folder that already has weeks 1-8 keeps all nine in the NotebookLM pack and audit.
     os.makedirs(raw, exist_ok=True)
     if old:
         key = lambda g: g.get('id') or g['name']   # Ed's module id survives a rename
@@ -334,6 +334,16 @@ def ed_to_md(xml, img_sink=None):
 
 
 # ----------------------------------------------------------------------------- builder
+def drop_readme(path, made_by_edpack):
+    """Older versions wrote contents-page READMEs into the archive. The folders already sort in Ed's
+    order, so they are no longer made; remove old ones, but only if edpack wrote them."""
+    try:
+        if made_by_edpack(open(path, encoding='utf-8').read()):
+            os.remove(path)
+    except (OSError, UnicodeDecodeError):
+        pass
+
+
 class Builder:
     def __init__(self, out, only=None):
         self.out = out; self.only = only   # module names to (re)build; None = all
@@ -472,15 +482,11 @@ class Builder:
         return '\n'.join(out)
 
     def build(self):
-        index = ['# %s - Ed Lessons offline archive' % self.dump.get('course', ''), '', '_Exported %s_' % self.dump.get('fetched_at', '')]
         for g in self.dump['modules']:
             gdir = os.path.join(self.out, safe(g['name'])); os.makedirs(gdir, exist_ok=True)
-            index += ['', '## ' + g['name']]
             for l in g['lessons']:
                 ldir = os.path.join(gdir, safe(l['title'])); os.makedirs(ldir, exist_ok=True)
                 img_dir = os.path.join(ldir, 'images')
-                index += ['', '### ' + l['title'], '']
-                lidx = ['# ' + l['title'], '', '_%s_' % g['name'], '']
                 made = set()
                 for n, s in enumerate(l['slides'], 1):
                     self.stats['slides'] += 1
@@ -489,8 +495,6 @@ class Builder:
                         have = [f for f in (base + '.pdf', base + '.md', base + ' (FAILED).md') if os.path.exists(os.path.join(ldir, f))]
                         if have:   # week already in the folder and not re-downloaded: keep its files
                             self.stats['written'] += 1
-                            lidx.append('- [%s](<%s>)' % (s['title'], have[0]))
-                            index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), have[0]))
                             continue
                     try:
                         if s['type'] == 'webpage':
@@ -518,17 +522,14 @@ class Builder:
                         fn = base + ' (FAILED).md'
                         open(os.path.join(ldir, fn), 'w', encoding='utf-8').write('# %s\n\nFailed: %s\n' % (s['title'], e))
                         self.stats['failed'].append((l['title'], s['title'], str(e)))
-                    lidx.append('- [%s](<%s>)' % (s['title'], fn))
-                    index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), fn))
                     made.update((fn, base + '.md'))
                 kept = self.only is not None and g['name'] not in self.only
                 if not kept:   # slides removed or renumbered on Ed: retire edpack's old numbered files
                     for f in sorted(os.listdir(ldir)):
                         if re.match(r'\d{2} - ', f) and f not in made and os.path.isfile(os.path.join(ldir, f)):
                             retire(self.out, os.path.join(ldir, f))
-                if not (kept and os.path.exists(os.path.join(ldir, 'README.md'))):
-                    open(os.path.join(ldir, 'README.md'), 'w', encoding='utf-8').write('\n'.join(lidx) + '\n')
-        open(os.path.join(self.out, 'README.md'), 'w', encoding='utf-8').write('\n'.join(index) + '\n')
+                drop_readme(os.path.join(ldir, 'README.md'), lambda t: t.startswith('# ' + l['title'] + '\n\n_'))
+        drop_readme(os.path.join(self.out, 'README.md'), lambda t: 'Ed Lessons offline archive' in t.split('\n', 1)[0])
         json.dump(self.stats, open(os.path.join(self.raw, 'build_stats.json'), 'w'), indent=1)
         log('built %d/%d slides, %d failed -> %s' % (self.stats['written'], self.stats['slides'], len(self.stats['failed']), self.out))
 
@@ -611,6 +612,10 @@ class Moodle:
             if '=' in part:
                 k, v = part.split('=', 1); self.s.cookies.set(k.strip(), v.strip(), domain=host)
 
+    def logged_in(self, host):
+        r = self.s.get('https://%s/my/' % host, timeout=60)
+        return r.ok and 'okta.com' not in r.url and '/login/' not in urlparse(r.url).path
+
     def get(self, url):
         r = self.s.get(url, timeout=120)
         if 'okta.com' in r.url or '/login/' in urlparse(r.url).path:
@@ -662,11 +667,167 @@ def moodle_key(root, url, ldir):
     return '%s | %s' % (os.path.relpath(ldir, root), url)
 
 MOODLE_HELP = '''
-  To download them, edpack needs your Moodle login session (it is never saved to disk):
+  To download them, edpack needs your Moodle login session. It is saved like the Ed token and
+  reused until Moodle ends that session (you log out, or it times out); then edpack asks again.
     1. Open Moodle in your browser and make sure you are logged in.
     2. Press F12. Chrome/Edge: Application tab > Cookies; Firefox: Storage tab > Cookies.
     3. Click the Moodle site, find the row named MoodleSession, copy its Value.
+  Tip: run  edpack moodle-setup  once and Chrome will hand edpack the session by itself.
 '''
+
+# ----------------------------------------------------------------------------- Chrome extension
+# A tiny extension, limited to the Moodle site, that sends the MoodleSession cookie to edpack
+# through Chrome's native messaging whenever it changes (i.e. when you log in to Moodle).
+# Chrome and Edge encrypt their cookie files, so asking the browser itself is the clean way.
+# The public key pins the unpacked extension's id, so the native host can allow only it.
+EXT_KEY = ('MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArUIUYcf31ckc9Kir170lMrM7JHyB6LSAm3XgaxCcSX9YvQY5DL07eTyb'
+           'Ab88uGr5Kxc04bp9OL0tmEvJ3UABjfMOFkuqPk8M1jOW5wgKB2V0pHIwcGoIo8s7kHVqRSv6gGxYlLtrmrJIqILHpv9EasqaPu3t6B4g'
+           'xE0PBzcP0L/W3ExPYTzVPvnuL4C1+09KSAtrHhFv2naLIkvteDhVQGXOjCnufPBa+N5qVgLbg3/tHa+O2lWPYokK1P7fPOjtExGbaeGJ'
+           'OlxiTg+FJdWILOuffb9vQ/MKbonVaSiL4fFtyGO4/Uplobo+RqjGnxlcfKXtGeQk/WcD0OVMYJyPdQIDAQAB')
+EXT_ID = 'hajkbejmcabbdioilnelfmdffmffdldb'
+NM_HOST = 'com.edpack.moodle'
+EXT_DIR = os.path.join(CONFIG_DIR, 'chrome-extension')
+
+EXT_JS = '''// edpack: pass the Moodle login session to edpack on this computer. Reads one cookie, nothing else.
+const DOMAIN = '%s';
+const send = (value) => chrome.runtime.sendNativeMessage('%s', {moodle_session: value, host: DOMAIN},
+                                                         () => void chrome.runtime.lastError);
+const sync = () => chrome.cookies.get({url: 'https://' + DOMAIN + '/', name: 'MoodleSession'},
+                                      (c) => { if (c) send(c.value); });
+chrome.cookies.onChanged.addListener(({cookie, removed}) => {
+  if (!removed && cookie.name === 'MoodleSession' && cookie.domain.replace(/^[.]/, '') === DOMAIN) send(cookie.value);
+});
+chrome.runtime.onStartup.addListener(sync);
+chrome.runtime.onInstalled.addListener(sync);
+'''
+
+def nm_dirs():
+    """Where Chrome and Edge look for native messaging hosts on macOS / Linux."""
+    home = os.path.expanduser('~')
+    if sys.platform == 'darwin':
+        base = os.path.join(home, 'Library', 'Application Support')
+        return [os.path.join(base, b, 'NativeMessagingHosts') for b in ('Google/Chrome', 'Microsoft Edge', 'Chromium')]
+    return [os.path.join(home, '.config', b, 'NativeMessagingHosts') for b in ('google-chrome', 'microsoft-edge', 'chromium')]
+
+NM_REG = ['\\'.join(('Software', b, 'NativeMessagingHosts', NM_HOST)) for b in ('Google\\Chrome', 'Microsoft\\Edge')]
+
+def cmd_moodle_setup(a):
+    if a.remove:
+        if sys.platform == 'win32':
+            import winreg
+            for k in NM_REG:
+                try: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, k)
+                except OSError: pass
+        else:
+            for d in nm_dirs():
+                p = os.path.join(d, NM_HOST + '.json')
+                if os.path.exists(p): os.remove(p)
+        for p in (EXT_DIR, os.path.join(CONFIG_DIR, NM_HOST + '.json'), os.path.join(CONFIG_DIR, 'native-host.bat'), os.path.join(CONFIG_DIR, 'native-host.sh')):
+            if os.path.isdir(p): shutil.rmtree(p)
+            elif os.path.exists(p): os.remove(p)
+        set_config('moodle_ext', None); set_config('moodle_session', None)
+        print('Removed. Also remove "edpack Moodle session" at chrome://extensions.'); return
+    host = a.host
+    os.makedirs(EXT_DIR, exist_ok=True)
+    manifest = {'manifest_version': 3, 'name': 'edpack Moodle session', 'version': '1.0', 'key': EXT_KEY,
+                'description': 'Passes your Moodle login session to edpack on this computer so it can download '
+                               'files linked from Ed. Reads only the MoodleSession cookie of %s.' % host,
+                'permissions': ['cookies', 'nativeMessaging'], 'host_permissions': ['https://%s/*' % host],
+                'background': {'service_worker': 'background.js'}}
+    json.dump(manifest, open(os.path.join(EXT_DIR, 'manifest.json'), 'w', encoding='utf-8'), indent=1)
+    open(os.path.join(EXT_DIR, 'background.js'), 'w', encoding='utf-8').write(EXT_JS % (host, NM_HOST))
+    # Chrome starts this launcher and talks to it over stdin/stdout.
+    if sys.platform == 'win32':
+        launcher = os.path.join(CONFIG_DIR, 'native-host.bat')
+        open(launcher, 'w').write('@echo off\n"%s" -u -m edpack native-host\n' % sys.executable)
+    else:
+        launcher = os.path.join(CONFIG_DIR, 'native-host.sh')
+        open(launcher, 'w').write('#!/bin/sh\nexec "%s" -u -m edpack native-host\n' % sys.executable)
+        os.chmod(launcher, 0o755)
+    hm = {'name': NM_HOST, 'description': 'edpack: receives the Moodle session from the edpack extension',
+          'path': launcher, 'type': 'stdio', 'allowed_origins': ['chrome-extension://%s/' % EXT_ID]}
+    if sys.platform == 'win32':
+        import winreg
+        p = os.path.join(CONFIG_DIR, NM_HOST + '.json'); json.dump(hm, open(p, 'w', encoding='utf-8'), indent=1)
+        for k in NM_REG:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, k) as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, p)
+    else:
+        for d in nm_dirs():
+            os.makedirs(d, exist_ok=True); json.dump(hm, open(os.path.join(d, NM_HOST + '.json'), 'w'), indent=1)
+    set_config('moodle_ext', host)
+    print('''
+  edpack is ready to receive your Moodle session. Now add the extension to Chrome (one time):
+    1. Open  chrome://extensions  (Edge: edge://extensions)
+    2. Turn on "Developer mode" (top right)
+    3. Click "Load unpacked" and choose this folder:
+         %s
+    4. Open %s in Chrome and log in as usual.
+  From then on edpack picks up your Moodle login by itself whenever you are logged in.
+  To undo:  edpack moodle-setup --remove
+''' % (EXT_DIR, host))
+
+def cmd_native_host(a):
+    """Started by Chrome: read one message from the extension, save the session, reply."""
+    import struct
+    if sys.platform == 'win32':
+        import msvcrt
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY); msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    head = sys.stdin.buffer.read(4)
+    if len(head) < 4: return
+    msg = json.loads(sys.stdin.buffer.read(struct.unpack('<I', head)[0]) or b'{}')
+    v = msg.get('moodle_session')
+    ok = isinstance(v, str) and 0 < len(v) < 256 and re.fullmatch(r'[A-Za-z0-9,-]+', v) is not None
+    if ok and load_config().get('moodle_session') != v:
+        set_config('moodle_session', v)
+    out = json.dumps({'ok': ok}).encode()
+    sys.stdout.buffer.write(struct.pack('<I', len(out)) + out); sys.stdout.buffer.flush()
+
+def set_config(key, value):
+    cfg = load_config()
+    if value is None: cfg.pop(key, None)
+    else: cfg[key] = value
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'))
+
+def moodle_login(host, what, root):
+    """A logged-in Moodle session: MOODLE_SESSION env var, else the saved one, else ask. None = skip."""
+    cookie, source = os.environ.get('MOODLE_SESSION'), 'env'
+    if not cookie:
+        cookie, source = load_config().get('moodle_session'), 'saved'
+    ext = load_config().get('moodle_ext')   # set by `edpack moodle-setup`
+    asked = False; tried = set()
+    while True:
+        if cookie and cookie not in tried:
+            tried.add(cookie)
+            mo = Moodle(cookie, host)
+            if mo.logged_in(host):
+                if source == 'typed': set_config('moodle_session', cookie)
+                return mo
+            if source in ('saved', 'chrome'):
+                set_config('moodle_session', None)
+                log('Moodle: the saved session has ended (logged out or timed out).')
+            else:
+                print('  Moodle did not accept that value: it is wrong or the session has already ended.')
+        elif cookie and source == 'chrome':
+            print('  Nothing new from Chrome yet. Make sure Moodle has finished loading and you are logged in.')
+        if not sys.stdin.isatty():
+            log('Moodle: %s. Run  edpack moodle --out "%s"  to do it.' % (what, root)); return None
+        if ext:
+            if not asked:
+                print('\n  Moodle: %s. Open https://%s in Chrome and log in if it asks;' % (what, host))
+                print('  the edpack extension passes the new session over by itself.'); asked = True
+            s = ask('  Press Enter once Moodle has loaded (or type skip, or paste a MoodleSession value)')
+            if s.lower() == 'skip':
+                log('Moodle: skipped. Run  edpack moodle --out "%s"  any time.' % root); return None
+            cookie, source = (s, 'typed') if s else (load_config().get('moodle_session'), 'chrome')
+            if not cookie: print('  Nothing from Chrome yet. Is the extension loaded (chrome://extensions)?')
+            continue
+        if not asked:
+            print('\n  Moodle: %s (zips, scripts, handouts).' % what + MOODLE_HELP); asked = True
+        cookie, source = ask('  Paste the MoodleSession value (or press Enter to skip)'), 'typed'
+        if not cookie:
+            log('Moodle: skipped. Run  edpack moodle --out "%s"  any time.' % root); return None
 
 def cmd_moodle(a):
     root = a.out
@@ -687,15 +848,9 @@ def cmd_moodle(a):
         return
     what = ', '.join(x for x in ('%d new file link(s) to download' % len(todo) if todo else '',
                                  '%d downloaded file(s) to check for updates' % len(recheck) if recheck else '') if x)
-    cookie = os.environ.get('MOODLE_SESSION')
-    if not cookie:
-        if not sys.stdin.isatty():
-            log('Moodle: %s. Run  edpack moodle --out "%s"  to do it.' % (what, root)); return
-        print('\n  Moodle: %s (zips, scripts, handouts).' % what + MOODLE_HELP)
-        cookie = ask('  Paste the MoodleSession value (or press Enter to skip)')
-        if not cookie:
-            log('Moodle: skipped. Run  edpack moodle --out "%s"  any time.' % root); return
-    mo = Moodle(cookie, urlparse((todo or recheck)[0][0]).netloc)
+    host = urlparse((todo or recheck)[0][0]).netloc
+    mo = moodle_login(host, what, root)
+    if not mo: return
     got = updated = 0; failed = []
     jobs = todo + recheck
     for i, (u, d) in enumerate(jobs, 1):
@@ -717,8 +872,8 @@ def cmd_moodle(a):
                 open(p, 'wb').write(data)
             done[k] = [n for n, _ in files]
         except MoodleExpired:
-            log('\nMoodle sent edpack to the login page, so that session value is wrong or has expired.'
-                '\nLog in to Moodle again, copy a fresh MoodleSession value and run  edpack moodle --out "%s"' % root)
+            set_config('moodle_session', None)
+            log('\nYour Moodle session ended part-way through. Log in to Moodle again and run  edpack moodle --out "%s"  for the rest.' % root)
             if not (got or updated): return
             break
         except Exception as e:
@@ -968,6 +1123,11 @@ def main():
             sp.add_argument('--course', required=name in ('fetch', 'run'), help='Ed course id, e.g. 20603')
             sp.add_argument('--weeks', help='e.g. 1  or  1-8  or  1,3,5   (default: all)')
             sp.add_argument('--out', help='output folder (default: ./ed-<course>)')
+    sp = sub.add_parser('moodle-setup', help='let Chrome pass your Moodle login to edpack (one-time setup)')
+    sp.add_argument('--host', default='learning.monash.edu', help='your Moodle site (default: learning.monash.edu)')
+    sp.add_argument('--remove', action='store_true', help='undo the setup')
+    sp.set_defaults(fn=cmd_moodle_setup)
+    sub.add_parser('native-host').set_defaults(fn=cmd_native_host)   # started by Chrome, not by you
     a = p.parse_args()
     if getattr(a, 'course', None) is None and getattr(a, 'out', None):
         pass
