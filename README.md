@@ -111,7 +111,7 @@ edpack
 
 It lists your units, asks which weeks you want and which folder is that unit's archive (pick one from the list or paste any path), then shows a progress bar and finishes with the audit report and the two paths you need. It stays open afterwards so you can archive another unit or reopen the folder.
 
-The week folders are named by Ed (e.g. `Week 9 - Debugging - Systematic Bug Hunting`) and go straight into the folder you picked. Run it again later with the next week and the same folder: the new week is added alongside the old ones, and the index, NotebookLM upload and audit cover every week in the folder. Picking a week you already have refreshes it. edpack remembers the folder per unit and offers it first next time.
+The week folders are named by Ed (e.g. `Week 9 - Debugging - Systematic Bug Hunting`) and go straight into the folder you picked. Run it again later with the next week and the same folder: the new week is added alongside the old ones, and the index, NotebookLM upload and audit cover every week in the folder. Picking a week you already have refreshes it so it matches Ed exactly: new slides are added, a renamed week or lesson has its folder renamed (your own files inside come along), and anything Ed no longer has is moved to `_raw/replaced/<date>/` rather than deleted. Files you add yourself are never touched. edpack remembers the folder per unit and offers it first next time.
 
 ### Scripted
 
@@ -120,10 +120,26 @@ edpack run   --course 39026 --weeks 1-8 --out ./FIT2109   # everything in one go
 edpack fetch --course 39026 --weeks 9   --out ./FIT2109   # download only
 edpack build --out ./FIT2109                              # raw data -> folders (works offline)
 edpack nblm  --out ./FIT2109                              # rebuild the NotebookLM folder
+edpack moodle --out ./FIT2109                             # download files the slides link to on Moodle
 edpack audit --out ./FIT2109                              # re-run the checks
 ```
 
 The course id is the number in the Ed URL: `edstem.org/au/courses/39026/lessons`.
+
+### Files on Moodle
+
+Many slides only say "download the zip from here" and link to Moodle. After building, edpack offers to download those files into a `moodle` folder inside the lesson's folder. They are part of your offline archive and are **not** copied into the NotebookLM upload folder.
+
+Monash has Moodle's app API switched off, so there is no permanent token like Ed's. Instead you lend edpack your browser's login session for that run:
+
+1. Open Moodle in your browser and make sure you are logged in.
+2. Press F12. Chrome/Edge: **Application** tab > **Cookies**. Firefox: **Storage** tab > **Cookies**.
+3. Click the Moodle site, find the row named `MoodleSession` and copy its **Value**.
+4. Paste it when edpack asks. Press Enter instead to skip.
+
+The value is used only for that run and never written to disk. It stops working when you log out of Moodle or the session times out; edpack tells you when that happens. Files already downloaded are skipped next time, except in weeks you pick again: those are re-checked, and if the lecturer replaced a file the new one is saved and the old one moved to `_raw/replaced/`. For scripted runs, set the `MOODLE_SESSION` environment variable instead.
+
+Treat that value like a password while you have it: anyone holding it is logged in to Moodle as you.
 
 ### Uploading to NotebookLM
 
@@ -137,7 +153,7 @@ Readings and quizzes go in as Markdown, which is the cleanest text input. Slides
 
 - **NotebookLM source caps.** Free accounts allow 50 sources per notebook, NotebookLM Pro allows 300. A full semester of one unit is typically 40 to 60 sources, so on a free account you may need to split it into two notebooks or upload only the weeks you need. Check the counter at the bottom of the upload dialog.
 - **Quiz answers depend on the unit.** If the unit releases solutions, every answer is marked. If not, only the questions you have already answered correctly are marked. edpack does not attempt quizzes for you.
-- **Files hosted outside Ed** (Moodle zips, Panopto videos, YouTube) are recorded as links, not downloaded. They are listed at the bottom of the archive's README.
+- **Videos** (Panopto, YouTube) are recorded as links, not downloaded. Moodle files are downloaded only if you give edpack your Moodle session (see *Files on Moodle*); otherwise they stay links and the audit counts how many are left.
 - **Images inside Markdown** are saved beside the file, but NotebookLM cannot read them from a `.md` upload. That is what the figures PDF is for.
 - **Scanned PDFs** come through with no text. The audit flags them.
 - **New Ed formats.** Ed adds slide types and content blocks from time to time. edpack does not drop unknown content: unknown blocks keep their text, unknown slide and question types are written out with their raw data, and the audit names them. They just will not look pretty until the converter learns about them.

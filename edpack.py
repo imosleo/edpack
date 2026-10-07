@@ -8,13 +8,14 @@ Usage:
   python edpack.py fetch  --course 20603 --weeks 1        # download raw data
   python edpack.py build  --course 20603                  # raw -> folders + Markdown
   python edpack.py nblm   --course 20603                  # NotebookLM upload folder
+  python edpack.py moodle --course 20603                  # download files the slides link to on Moodle
   python edpack.py audit  --course 20603                  # self-check report
   python edpack.py run    --course 20603 --weeks 1-8      # all of the above
 
 Get a token at https://edstem.org/<region>/settings/api-tokens
 """
-import argparse, hashlib, json, os, re, sys, time
-from urllib.parse import urljoin, urlparse
+import argparse, hashlib, json, os, re, shutil, sys, time
+from urllib.parse import unquote, urljoin, urlparse
 
 try:
     import requests
@@ -68,6 +69,16 @@ def parse_weeks(spec):
     if not out: raise ValueError('no weeks given')
     return out
 
+RUN_STAMP = time.strftime('%Y-%m-%d %H%M%S')
+
+def retire(root, path):
+    """Move an out-of-date file or folder into _raw/replaced/<this run>/ instead of deleting it."""
+    rel = os.path.relpath(path, root)
+    dst = os.path.join(root, '_raw', 'replaced', RUN_STAMP, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(path, dst)
+    log('  out of date, moved to _raw/replaced/%s: %s' % (RUN_STAMP, rel))
+
 def week_of(name):
     m = re.search(r'week\s*(\d+)', name, re.I)
     return int(m.group(1)) if m else None
@@ -92,7 +103,7 @@ def check_weeks(weeks, available):
 class Ed:
     def __init__(self, tok):
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.3'})
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.4'})
 
     def get(self, path, **kw):
         for attempt in range(3):
@@ -185,10 +196,30 @@ def cmd_fetch(a):
     # week 9 into a folder that already has weeks 1-8 keeps all nine in the index and NotebookLM pack.
     os.makedirs(raw, exist_ok=True)
     if old:
+        key = lambda g: g.get('id') or g['name']   # Ed's module id survives a rename
+        new = {key(g): g for g in dump['modules']}
+        kept = [g for g in old['modules'] if key(g) not in new]
+        def follow(src, dst):
+            """Ed renamed a week or lesson: rename its folder so your own files and Moodle downloads come along."""
+            if os.path.isdir(src) and os.path.normcase(src) != os.path.normcase(dst):
+                if os.path.exists(dst): retire(a.out, src)
+                else:
+                    os.rename(src, dst); log('  renamed on Ed: %s -> %s' % (os.path.relpath(src, a.out), os.path.relpath(dst, a.out)))
+        for o in old['modules']:
+            n = new.get(key(o))
+            if not n: continue
+            gdir = os.path.join(a.out, safe(n['name']))
+            follow(os.path.join(a.out, safe(o['name'])), gdir)
+            now = {l['id']: l for l in n['lessons']}
+            for l in o['lessons']:
+                p = os.path.join(gdir, safe(l['title']))
+                if l.get('id') in now:
+                    follow(p, os.path.join(gdir, safe(now[l['id']]['title'])))
+                elif os.path.isdir(p):
+                    retire(a.out, p)                  # lesson removed from Ed
+        order = {key(g): g['order'] for g in groups}
+        dump['modules'] = sorted(kept + dump['modules'], key=lambda g: order.get(key(g), g.get('order', 999)))
         fresh = {g['name'] for g in dump['modules']}
-        kept = [g for g in old['modules'] if g['name'] not in fresh]
-        order = {g['name']: g['order'] for g in groups}
-        dump['modules'] = sorted(kept + dump['modules'], key=lambda g: order.get(g['name'], g.get('order', 999)))
         dump['errors'] = [e for e in old.get('errors', []) if e.get('module') not in fresh] + dump['errors']
         if kept:
             log('kept %d module(s) already in this folder: %s' % (len(kept), ', '.join(g['name'] for g in kept)))
@@ -450,6 +481,7 @@ class Builder:
                 img_dir = os.path.join(ldir, 'images')
                 index += ['', '### ' + l['title'], '']
                 lidx = ['# ' + l['title'], '', '_%s_' % g['name'], '']
+                made = set()
                 for n, s in enumerate(l['slides'], 1):
                     self.stats['slides'] += 1
                     base = '%02d - %s' % (n, safe(s['title'])); det = s.get('detail') or {}
@@ -488,7 +520,12 @@ class Builder:
                         self.stats['failed'].append((l['title'], s['title'], str(e)))
                     lidx.append('- [%s](<%s>)' % (s['title'], fn))
                     index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), fn))
+                    made.update((fn, base + '.md'))
                 kept = self.only is not None and g['name'] not in self.only
+                if not kept:   # slides removed or renumbered on Ed: retire edpack's old numbered files
+                    for f in sorted(os.listdir(ldir)):
+                        if re.match(r'\d{2} - ', f) and f not in made and os.path.isfile(os.path.join(ldir, f)):
+                            retire(self.out, os.path.join(ldir, f))
                 if not (kept and os.path.exists(os.path.join(ldir, 'README.md'))):
                     open(os.path.join(ldir, 'README.md'), 'w', encoding='utf-8').write('\n'.join(lidx) + '\n')
         open(os.path.join(self.out, 'README.md'), 'w', encoding='utf-8').write('\n'.join(index) + '\n')
@@ -502,7 +539,11 @@ def cmd_build(a):
 
 # ----------------------------------------------------------------------------- NotebookLM pack
 def cmd_nblm(a):
-    root = a.out; up = os.path.join(root, 'NotebookLM upload'); os.makedirs(up, exist_ok=True)
+    root = a.out; up = os.path.join(root, 'NotebookLM upload')
+    # Everything here is generated from the week folders, so start clean: a renamed or removed
+    # slide must not leave an old copy behind to be uploaded twice.
+    if os.path.isdir(up): shutil.rmtree(up)
+    os.makedirs(up)
     dump = json.load(open(os.path.join(root, '_raw', 'ed_dump.json'), encoding='utf-8'))
     npdf = nmd = nfig = 0
     for g in dump['modules']:
@@ -551,6 +592,142 @@ def cmd_nblm(a):
     log('NotebookLM upload folder: %d merged .md, %d PDFs, %d figure PDFs -> %s' % (nmd, npdf, nfig, up))
 
 
+# ----------------------------------------------------------------------------- Moodle files
+# Ed slides often just say "download the zip from here: <Moodle link>". Monash has the Moodle
+# mobile web service turned off, so there is no API token; we borrow the browser's login
+# session cookie instead. Downloads go into a "moodle" folder inside the lesson folder:
+# they are part of the offline archive, not the NotebookLM upload.
+MOODLE_LINK = re.compile(r'https?://[^\s)<>\]"\']+/mod/(?:resource|folder)/view\.php\?id=\d+')
+
+class MoodleExpired(Exception): pass
+
+class Moodle:
+    def __init__(self, cookie, host):
+        self.s = requests.Session(); self.s.headers['User-Agent'] = 'Mozilla/5.0 edpack/0.4'
+        cookie = cookie.strip().strip('"')
+        if cookie.lower().startswith('cookie:'): cookie = cookie[7:]
+        if '=' not in cookie: cookie = 'MoodleSession=' + cookie
+        for part in cookie.split(';'):   # set on the Moodle host only, never sent to Okta
+            if '=' in part:
+                k, v = part.split('=', 1); self.s.cookies.set(k.strip(), v.strip(), domain=host)
+
+    def get(self, url):
+        r = self.s.get(url, timeout=120)
+        if 'okta.com' in r.url or '/login/' in urlparse(r.url).path:
+            raise MoodleExpired()
+        r.raise_for_status()
+        return r
+
+def _filename(r):
+    cd = r.headers.get('Content-Disposition', '')
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I) or re.search(r'filename="?([^";]+)"?', cd, re.I)
+    return unquote(m.group(1) if m else os.path.basename(urlparse(r.url).path)) or 'file'
+
+def moodle_files(mo, url):
+    """(filename, bytes) for each file behind a Moodle resource or folder link."""
+    r = mo.get(url)
+    if 'text/html' not in r.headers.get('Content-Type', ''):
+        return [(_filename(r), r.content)]          # Moodle sent the file straight away
+    page = BeautifulSoup(r.text, 'html.parser')
+    main = page.select_one('#region-main') or page
+    hrefs = []
+    for t in main.select('a[href*="pluginfile.php"], [src*="pluginfile.php"], object[data*="pluginfile.php"]'):
+        h = t.get('href') or t.get('src') or t.get('data')
+        if h and '/user/icon/' not in h and h not in hrefs: hrefs.append(h)
+    if not hrefs:
+        raise ValueError('no file found on the Moodle page')
+    out = []
+    for h in hrefs:
+        f = mo.get(urljoin(r.url, h)); out.append((_filename(f), f.content))
+    return out
+
+def moodle_links(root, dump):
+    """(url, lesson dir) for every Moodle file link in the archive's slides."""
+    found = []
+    for g in dump['modules']:
+        for l in g['lessons']:
+            ldir = os.path.join(root, safe(g['name']), safe(l['title']))
+            if not os.path.isdir(ldir): continue
+            for fn in sorted(os.listdir(ldir)):
+                if fn.endswith('.md') and fn != 'README.md':
+                    for u in MOODLE_LINK.findall(open(os.path.join(ldir, fn), encoding='utf-8').read()):
+                        if (u, ldir) not in found: found.append((u, ldir))
+    return found
+
+def moodle_done(root):
+    p = os.path.join(root, '_raw', 'moodle.json')
+    return json.load(open(p, encoding='utf-8')) if os.path.exists(p) else {}
+
+def moodle_key(root, url, ldir):
+    return '%s | %s' % (os.path.relpath(ldir, root), url)
+
+MOODLE_HELP = '''
+  To download them, edpack needs your Moodle login session (it is never saved to disk):
+    1. Open Moodle in your browser and make sure you are logged in.
+    2. Press F12. Chrome/Edge: Application tab > Cookies; Firefox: Storage tab > Cookies.
+    3. Click the Moodle site, find the row named MoodleSession, copy its Value.
+'''
+
+def cmd_moodle(a):
+    root = a.out
+    dump = json.load(open(os.path.join(root, '_raw', 'ed_dump.json'), encoding='utf-8'))
+    done = moodle_done(root)
+    links = moodle_links(root, dump)
+    def have(u, d):
+        k = moodle_key(root, u, d)
+        return k in done and all(os.path.exists(os.path.join(d, 'moodle', f)) for f in done[k])
+    todo = [(u, d) for u, d in links if not have(u, d)]
+    # Weeks picked again this run (or every week, for a plain `edpack moodle`) also get their
+    # already-downloaded files checked, in case the lecturer replaced one behind the same link.
+    fresh = getattr(a, 'fresh', None)
+    weeks = None if fresh is None else {safe(n) for n in fresh}
+    recheck = [(u, d) for u, d in links if have(u, d) and (weeks is None or os.path.relpath(d, root).split(os.sep)[0] in weeks)]
+    if not todo and not recheck:
+        log('Moodle: %s' % ('no Moodle file links in these slides' if not links else 'all %d linked file(s) already downloaded' % len(links)))
+        return
+    what = ', '.join(x for x in ('%d new file link(s) to download' % len(todo) if todo else '',
+                                 '%d downloaded file(s) to check for updates' % len(recheck) if recheck else '') if x)
+    cookie = os.environ.get('MOODLE_SESSION')
+    if not cookie:
+        if not sys.stdin.isatty():
+            log('Moodle: %s. Run  edpack moodle --out "%s"  to do it.' % (what, root)); return
+        print('\n  Moodle: %s (zips, scripts, handouts).' % what + MOODLE_HELP)
+        cookie = ask('  Paste the MoodleSession value (or press Enter to skip)')
+        if not cookie:
+            log('Moodle: skipped. Run  edpack moodle --out "%s"  any time.' % root); return
+    mo = Moodle(cookie, urlparse((todo or recheck)[0][0]).netloc)
+    got = updated = 0; failed = []
+    jobs = todo + recheck
+    for i, (u, d) in enumerate(jobs, 1):
+        progress(i, len(jobs), os.path.relpath(d, root)[:45])
+        k = moodle_key(root, u, d); mdir = os.path.join(d, 'moodle')
+        try:
+            files = [(safe(n) or 'file', b) for n, b in moodle_files(mo, u)]
+            for name in done.get(k, []):            # file renamed or dropped on Moodle
+                if name not in {n for n, _ in files} and os.path.exists(os.path.join(mdir, name)):
+                    retire(root, os.path.join(mdir, name))
+            for name, data in files:
+                p = os.path.join(mdir, name)
+                if os.path.exists(p):
+                    if open(p, 'rb').read() == data: continue
+                    retire(root, p); updated += 1   # lecturer replaced the file: keep the old copy aside
+                else:
+                    got += 1
+                os.makedirs(mdir, exist_ok=True)
+                open(p, 'wb').write(data)
+            done[k] = [n for n, _ in files]
+        except MoodleExpired:
+            log('\nMoodle sent edpack to the login page, so that session value is wrong or has expired.'
+                '\nLog in to Moodle again, copy a fresh MoodleSession value and run  edpack moodle --out "%s"' % root)
+            if not (got or updated): return
+            break
+        except Exception as e:
+            failed.append((u, str(e)))
+    json.dump(done, open(os.path.join(root, '_raw', 'moodle.json'), 'w', encoding='utf-8'), indent=1)
+    log('\nMoodle: %d new file(s), %d updated (%d link(s) re-checked), %d failed' % (got, updated, len(recheck), len(failed)))
+    for u, e in failed: log('  ! %s: %s' % (u, e))
+
+
 # ----------------------------------------------------------------------------- audit
 def cmd_audit(a):
     root = a.out; raw = os.path.join(root, '_raw')
@@ -558,7 +735,7 @@ def cmd_audit(a):
     stats = json.load(open(os.path.join(raw, 'build_stats.json'))) if os.path.exists(os.path.join(raw, 'build_stats.json')) else {}
     problems = []
     expected = sum(len(l['slides']) for g in dump['modules'] for l in g['lessons'])
-    files = pdfs = pdf_pages = pdf_blank = quiz_q = quiz_ok = quiz_none = imgs_missing = short = 0
+    files = pdfs = pdf_pages = pdf_blank = quiz_q = quiz_ok = quiz_none = imgs_missing = short = link_only = 0
     for g in dump['modules']:
         for l in g['lessons']:
             ldir = os.path.join(root, safe(g['name']), safe(l['title']))
@@ -577,7 +754,10 @@ def cmd_audit(a):
                 elif fn.endswith('.md'):
                     t = open(p, encoding='utf-8').read()
                     if len(t.split()) < 30 and not fn[:-3] + '.pdf' in os.listdir(ldir):
-                        short += 1; problems.append('very short file (%d words): %s' % (len(t.split()), p))
+                        if re.search(r'https?://', t):
+                            link_only += 1   # slide is just a pointer (Moodle file, video); reported below
+                        else:
+                            short += 1; problems.append('very short file (%d words): %s' % (len(t.split()), p))
                     for m in re.finditer(r'!\[[^\]]*\]\((images/[^)]+)\)', t):
                         if not os.path.exists(os.path.join(ldir, m.group(1))):
                             imgs_missing += 1; problems.append('image link broken: %s -> %s' % (p, m.group(1)))
@@ -602,6 +782,11 @@ def cmd_audit(a):
     print('quiz questions        : %d  (%d confirmed correct, %d unanswered)' % (quiz_q, quiz_ok, quiz_none))
     print('fetch errors          : %d' % len(dump.get('errors', [])))
     print('external links noted  : %d' % len(set(stats.get('external', []))))
+    print('link-only slides      : %d  (Moodle files, videos; not counted as problems)' % link_only)
+    links = moodle_links(root, dump); mdone = moodle_done(root)
+    pending = [(u, d) for u, d in links if moodle_key(root, u, d) not in mdone]
+    print('Moodle files          : %d of %d link(s) downloaded%s' % (len(links) - len(pending), len(links),
+          ('   (get the rest:  edpack moodle --out "%s")' % root) if pending else ''))
     print('problems              : %d' % len(problems))
     for p in problems: print('  ! ' + p)
     if not problems: print('  none - archive is complete and consistent')
@@ -622,11 +807,14 @@ def cmd_setup(a):
     print('saved to', CONFIG)
 
 def cmd_run(a):
-    cmd_fetch(a); cmd_build(a); cmd_nblm(a); cmd_audit(a)
+    cmd_fetch(a); cmd_build(a); cmd_nblm(a); cmd_moodle(a); cmd_audit(a)
 
 
 def ask(prompt, default=None):
-    s = input('%s%s: ' % (prompt, (' [%s]' % default) if default is not None else '')).strip()
+    try:
+        s = input('%s%s: ' % (prompt, (' [%s]' % default) if default is not None else '')).strip()
+    except EOFError:   # no keyboard (piped or scheduled run): take the default
+        s = ''
     return s or (default if default is not None else '')
 
 def remember_location(course_id, path):
@@ -750,10 +938,11 @@ def archive_one(ed, courses):
 
     a = argparse.Namespace(course=str(course['id']), weeks=weeks, out=out)
     t0 = time.time()
-    print('\n== 1/4 Downloading from Ed'); cmd_fetch(a)
-    print('\n== 2/4 Converting to Markdown and collecting PDFs'); cmd_build(a)
-    print('\n== 3/4 Building the NotebookLM upload folder'); cmd_nblm(a)
-    print('\n== 4/4 Checking the result'); cmd_audit(a)
+    print('\n== 1/5 Downloading from Ed'); cmd_fetch(a)
+    print('\n== 2/5 Converting to Markdown and collecting PDFs'); cmd_build(a)
+    print('\n== 3/5 Building the NotebookLM upload folder'); cmd_nblm(a)
+    print('\n== 4/5 Files linked on Moodle'); cmd_moodle(a)
+    print('\n== 5/5 Checking the result'); cmd_audit(a)
     print('\n  Done in %d seconds.' % (time.time() - t0))
     print('  Archive:            %s' % out)
     print('  NotebookLM upload:  %s' % os.path.join(out, 'NotebookLM upload'))
@@ -773,7 +962,7 @@ def main():
     p = argparse.ArgumentParser(prog='edpack', description='Archive Ed Lessons offline, NotebookLM-ready. No AI involved. Run with no arguments for the interactive mode.')
     sub = p.add_subparsers(dest='cmd', required=True)
     for name, fn, needs in [('setup', cmd_setup, False), ('fetch', cmd_fetch, True), ('build', cmd_build, True),
-                            ('nblm', cmd_nblm, True), ('audit', cmd_audit, True), ('run', cmd_run, True)]:
+                            ('nblm', cmd_nblm, True), ('moodle', cmd_moodle, True), ('audit', cmd_audit, True), ('run', cmd_run, True)]:
         sp = sub.add_parser(name); sp.set_defaults(fn=fn)
         if needs:
             sp.add_argument('--course', required=name in ('fetch', 'run'), help='Ed course id, e.g. 20603')
