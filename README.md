@@ -65,6 +65,30 @@ edpack
 
 If Windows says `edpack` is not recognised, pip printed the folder it installed the command into (something like `...\Python\Python3xx\Scripts`). Add that folder to your PATH once, or run `python -m edpack` instead.
 
+## Updating
+
+New versions are listed under [Releases](https://github.com/imosleo/edpack/releases). To check which one you have:
+
+```bash
+pip show edpack
+```
+
+If you installed with `git clone` as above, go back into that folder and pull the new code:
+
+```bash
+cd edpack
+git pull
+pip install .
+```
+
+If you no longer have that folder, update straight from GitHub instead:
+
+```bash
+pip install --upgrade git+https://github.com/imosleo/edpack.git
+```
+
+Your saved token and remembered folders live in `~/.edpack/config.json`, so they carry over. Archives made with an older version keep working: point the new version at the same unit folder and it adds to what is there.
+
 ## Getting your Ed API token
 
 edpack never sees your password. It uses a personal API token that Ed issues to you.
