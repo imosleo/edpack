@@ -103,7 +103,7 @@ def check_weeks(weeks, available):
 class Ed:
     def __init__(self, tok):
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.4'})
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.4.1'})
 
     def get(self, path, **kw):
         for attempt in range(3):
@@ -754,7 +754,7 @@ def cmd_audit(a):
                 elif fn.endswith('.md'):
                     t = open(p, encoding='utf-8').read()
                     if len(t.split()) < 30 and not fn[:-3] + '.pdf' in os.listdir(ldir):
-                        if re.search(r'https?://', t):
+                        if re.search(r'https?://', t) or 'interactive workspace only' in t:
                             link_only += 1   # slide is just a pointer (Moodle file, video); reported below
                         else:
                             short += 1; problems.append('very short file (%d words): %s' % (len(t.split()), p))
@@ -782,7 +782,7 @@ def cmd_audit(a):
     print('quiz questions        : %d  (%d confirmed correct, %d unanswered)' % (quiz_q, quiz_ok, quiz_none))
     print('fetch errors          : %d' % len(dump.get('errors', [])))
     print('external links noted  : %d' % len(set(stats.get('external', []))))
-    print('link-only slides      : %d  (Moodle files, videos; not counted as problems)' % link_only)
+    print('link-only slides      : %d  (Moodle files, videos, empty Ed workspaces; not counted as problems)' % link_only)
     links = moodle_links(root, dump); mdone = moodle_done(root)
     pending = [(u, d) for u, d in links if moodle_key(root, u, d) not in mdone]
     print('Moodle files          : %d of %d link(s) downloaded%s' % (len(links) - len(pending), len(links),
