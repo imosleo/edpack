@@ -54,20 +54,38 @@ def token():
     return t
 
 def parse_weeks(spec):
-    if not spec: return None
+    """'1' / '1-8' / '1,3,5' / 'all' -> set of ints (None = all). Raises ValueError on bad input."""
+    if not spec or spec.strip().lower() == 'all': return None
     out = set()
-    for part in spec.split(','):
+    for part in spec.replace(' ', '').split(','):
+        if not part: continue
         if '-' in part:
-            a, b = part.split('-'); out.update(range(int(a), int(b) + 1))
+            a, b = part.split('-', 1)
+            if int(a) > int(b): raise ValueError('range %s is backwards' % part)
+            out.update(range(int(a), int(b) + 1))
         else:
             out.add(int(part))
+    if not out: raise ValueError('no weeks given')
     return out
+
+def week_of(name):
+    m = re.search(r'week\s*(\d+)', name, re.I)
+    return int(m.group(1)) if m else None
+
+def check_weeks(weeks, available):
+    """Return an error message if any requested week is not in the course, else None."""
+    if weeks is None: return None
+    missing = sorted(weeks - set(available))
+    if missing:
+        return 'Week %s %s not exist in this course. Available: %s' % (
+            ', '.join(map(str, missing)), 'does' if len(missing) == 1 else 'do', ', '.join(map(str, sorted(available))))
+    return None
 
 
 class Ed:
     def __init__(self, tok):
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.1'})
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.2'})
 
     def get(self, path, **kw):
         for attempt in range(3):
@@ -99,7 +117,10 @@ class Cache:
 # ----------------------------------------------------------------------------- fetch
 def cmd_fetch(a):
     ed = Ed(token())
-    weeks = parse_weeks(a.weeks)
+    try:
+        weeks = parse_weeks(a.weeks)
+    except ValueError as e:
+        sys.exit('Bad --weeks value "%s" (%s). Use e.g. 1  or  1-8  or  1,3,5' % (a.weeks, e))
     L = ed.get('/courses/%s/lessons' % a.course)
     modules = L.get('modules') or []
     lessons = L.get('lessons') or []
@@ -107,13 +128,19 @@ def cmd_fetch(a):
 
     # Lessons are grouped by module; modules are usually named "Week N: ...".
     groups = []
-    for m in modules:
-        wk = re.search(r'week\s*(\d+)', m['name'], re.I)
-        groups.append({'id': m['id'], 'name': m['name'], 'week': int(wk.group(1)) if wk else None})
+    for i, m in enumerate(modules):
+        groups.append({'id': m['id'], 'name': m['name'], 'week': week_of(m['name']), 'order': i})
     unmoduled = [l for l in lessons if not any(l.get('module_id') == g['id'] for g in groups)]
     if unmoduled:
-        groups.append({'id': None, 'name': 'Other lessons', 'week': None})
+        groups.append({'id': None, 'name': 'Other lessons', 'week': None, 'order': len(groups)})
 
+    err = check_weeks(weeks, [g['week'] for g in groups if g['week'] is not None])
+    if err:
+        sys.exit(err)
+    raw = os.path.join(a.out, '_raw'); path = os.path.join(raw, 'ed_dump.json')
+    old = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else None
+    if old and str(old.get('course')) != str(a.course):
+        sys.exit('%s already holds an archive of another Ed course (%s). Pick a different folder.' % (a.out, old.get('course')))
     selected = [g for g in groups if weeks is None or g['week'] in weeks]
     total = sum(l.get('slide_count') or 0 for g in selected
                 for l in ([x for x in lessons if x.get('module_id') == g['id']] if g['id'] else unmoduled))
@@ -121,7 +148,7 @@ def cmd_fetch(a):
     for g in selected:
         ls = [l for l in lessons if l.get('module_id') == g['id']] if g['id'] else unmoduled
         ls.sort(key=lambda l: (l.get('index') if l.get('index') is not None else 999, l['id']))
-        G = {'id': g['id'], 'name': g['name'], 'week': g['week'], 'lessons': []}
+        G = {'id': g['id'], 'name': g['name'], 'week': g['week'], 'order': g['order'], 'lessons': []}
         log('\n%s' % g['name'])
         for l in ls:
             log('  %s' % l['title'])
@@ -139,15 +166,26 @@ def cmd_fetch(a):
                     if s['type'] == 'code' and S['detail'].get('challenge_id'):
                         S['challenge'] = ed.get('/challenges/%s?view=1' % S['detail']['challenge_id']).get('challenge')
                 except Exception as e:
-                    dump['errors'].append({'slide': s['id'], 'title': s['title'], 'error': str(e)})
+                    dump['errors'].append({'module': g['name'], 'slide': s['id'], 'title': s['title'], 'error': str(e)})
                 les['slides'].append(S)
             G['lessons'].append(les)
         dump['modules'].append(G)
 
-    raw = os.path.join(a.out, '_raw'); os.makedirs(raw, exist_ok=True)
-    json.dump(dump, open(os.path.join(raw, 'ed_dump.json'), 'w', encoding='utf-8'), indent=1)
     n = sum(len(l['slides']) for g in dump['modules'] for l in g['lessons'])
     log('\nfetched %d modules, %d slides, %d errors' % (len(dump['modules']), n, len(dump['errors'])))
+
+    # Add to an existing archive of the same course instead of replacing it, so fetching
+    # week 9 into a folder that already has weeks 1-8 keeps all nine in the index and NotebookLM pack.
+    os.makedirs(raw, exist_ok=True)
+    if old:
+        fresh = {g['name'] for g in dump['modules']}
+        kept = [g for g in old['modules'] if g['name'] not in fresh]
+        order = {g['name']: g['order'] for g in groups}
+        dump['modules'] = sorted(kept + dump['modules'], key=lambda g: order.get(g['name'], g.get('order', 999)))
+        dump['errors'] = [e for e in old.get('errors', []) if e.get('module') not in fresh] + dump['errors']
+        if kept:
+            log('kept %d module(s) already in this folder: %s' % (len(kept), ', '.join(g['name'] for g in kept)))
+    json.dump(dump, open(path, 'w', encoding='utf-8'), indent=1)
 
 
 def progress(done, total, label=''):
@@ -573,37 +611,54 @@ def ask(prompt, default=None):
     s = input('%s%s: ' % (prompt, (' [%s]' % default) if default is not None else '')).strip()
     return s or (default if default is not None else '')
 
-def remember_location(path):
+def remember_location(course_id, path):
     cfg = load_config()
-    recent = [p for p in cfg.get('recent', []) if os.path.normcase(p) != os.path.normcase(path)]
-    cfg['recent'] = [path] + recent[:4]
+    cfg.setdefault('course_dirs', {})[str(course_id)] = path
     os.makedirs(CONFIG_DIR, exist_ok=True)
     json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'))
 
-def choose_location():
+def archive_course(path):
+    """Course id of the edpack archive in this folder, or None."""
+    p = os.path.join(path, '_raw', 'ed_dump.json')
+    try:
+        return str(json.load(open(p, encoding='utf-8')).get('course'))
+    except Exception:
+        return None
+
+def choose_location(course):
+    """Pick the course folder itself; Ed's week folders are created directly inside it."""
     home = os.path.expanduser('~')
-    recent = [p for p in load_config().get('recent', []) if os.path.isdir(p)]
-    standard = [os.path.join(home, d) for d in ('Documents', 'Desktop', 'Downloads') if os.path.isdir(os.path.join(home, d))]
+    code = safe(course.get('code') or ('ed-%s' % course['id']))
+    last = load_config().get('course_dirs', {}).get(str(course['id']))
     options = []
-    for p in recent + standard + [os.getcwd()]:
-        if all(os.path.normcase(p) != os.path.normcase(o) for _, o in options):
-            options.append(('recent' if p in recent else ('current folder' if p == os.getcwd() else ''), p))
-    print('\n  Save it inside which folder?')
+    if last and os.path.isdir(last):
+        options.append(('last used for %s' % code, last))
+    for d in ('Documents', 'Desktop', 'Downloads'):
+        if os.path.isdir(os.path.join(home, d)):
+            p = os.path.join(home, d, code)
+            if all(os.path.normcase(p) != os.path.normcase(o) for _, o in options):
+                options.append(('' if os.path.isdir(p) else 'new', p))
+    print('\n  Which folder is this course\'s archive? The week folders go straight inside it.')
     for i, (tag, p) in enumerate(options, 1):
         print('   %2d. %s%s' % (i, p, ('   (%s)' % tag) if tag else ''))
-    print('    or type any folder path')
+    print('    or paste any folder path')
     while True:
         s = ask('  Choice', '1')
         if s.isdigit() and 1 <= int(s) <= len(options):
-            return options[int(s) - 1][1]
-        p = os.path.abspath(os.path.expanduser(s.strip('"')))
-        if os.path.isdir(p):
-            return p
-        if os.path.isdir(os.path.dirname(p)):
-            if ask('  %s does not exist. Create it? (y/n)' % p, 'y').lower() in ('y', 'yes'):
-                os.makedirs(p); return p
+            p = options[int(s) - 1][1]
         else:
-            print('  That folder was not found. Type a number from the list or a full path.')
+            p = os.path.abspath(os.path.expanduser(s.strip().strip('"')))
+        other = archive_course(p)
+        if other and other != str(course['id']):
+            print('  That folder already holds an archive of a different Ed course (%s). Pick another.' % other); continue
+        if not os.path.isdir(p):
+            drive = os.path.splitdrive(p)[0] + os.sep
+            if not os.path.isdir(drive if os.path.splitdrive(p)[0] else os.path.dirname(p)):
+                print('  That location was not found. Type a number from the list or a full path.'); continue
+            if ask('  %s does not exist yet. Create it? (y/n)' % p, 'y').lower() not in ('y', 'yes'):
+                continue
+            os.makedirs(p)
+        return p
 
 def wizard():
     """Interactive mode: runs when edpack is started with no arguments."""
@@ -646,21 +701,32 @@ def archive_one(ed, courses):
         L = ed.get('/courses/%s/lessons' % course['id'])
         if L.get('lessons'): break
         print('  %s has no Ed Lessons (it may only use Ed for discussion). Pick another course.' % course.get('code'))
-    weeks_avail = sorted({int(m.group(1)) for mod in L.get('modules', []) for m in [re.search(r'week\s*(\d+)', mod['name'], re.I)] if m})
+    weeks_avail = sorted({w for mod in L.get('modules', []) for w in [week_of(mod['name'])] if w is not None})
     print('\n  %s has %d lessons in %d modules.' % (course.get('code'), len(L.get('lessons', [])), len(L.get('modules', []))))
     if weeks_avail:
         print('  Weeks available: %s' % ', '.join(str(w) for w in weeks_avail))
-        weeks = ask('  Which weeks? (e.g. 1  or  1-8  or  1,3,5  or  all)', 'all')
-        weeks = None if weeks.lower() == 'all' else weeks
+        while True:
+            weeks = ask('  Which weeks? (e.g. 1  or  1-8  or  1,3,5  or  all)', 'all')
+            try:
+                err = check_weeks(parse_weeks(weeks), weeks_avail)
+            except ValueError:
+                err = '"%s" is not a week list. Type e.g. 9  or  1-8  or  1,3,5  or  all' % weeks
+            if not err: break
+            print('  ' + err)
+        weeks = None if weeks.strip().lower() == 'all' else weeks
     else:
         print('  Modules are not named by week, so everything will be archived.'); weeks = None
 
-    default_name = safe(course.get('code') or ('ed-%s' % course['id']))
-    name = ask('\n  Folder name for the archive', default_name)
-    where = choose_location()
-    out = os.path.join(where, safe(name))
-    remember_location(where)
-    print('\n  Archive will be written to:\n    %s\n' % out)
+    out = choose_location(course)
+    remember_location(course['id'], out)
+    if archive_course(out):
+        have = [g['name'] for g in json.load(open(os.path.join(out, '_raw', 'ed_dump.json'), encoding='utf-8'))['modules']]
+        print('\n  This folder already has: %s' % '; '.join(have))
+        print('  New weeks are added; weeks you picked again are refreshed.')
+    mods = [m['name'] for m in L.get('modules', []) if weeks is None or week_of(m['name']) in parse_weeks(weeks)]
+    print('\n  Will write into:\n    %s' % out)
+    for m in mods: print('      %s' % safe(m))
+    print()
     if ask('  Start? (y/n)', 'y').lower() not in ('y', 'yes'):
         print('  Cancelled.'); return None
 

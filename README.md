@@ -85,7 +85,9 @@ Keep the token private. It grants the same read access to Ed that you have. If i
 edpack
 ```
 
-It lists your units, asks which weeks you want, where to save, then shows a progress bar and finishes with the audit report and the two paths you need. It stays open afterwards so you can archive another unit or reopen the folder.
+It lists your units, asks which weeks you want and which folder is that unit's archive (pick one from the list or paste any path), then shows a progress bar and finishes with the audit report and the two paths you need. It stays open afterwards so you can archive another unit or reopen the folder.
+
+The week folders are named by Ed (e.g. `Week 9 - Debugging - Systematic Bug Hunting`) and go straight into the folder you picked. Run it again later with the next week and the same folder: the new week is added alongside the old ones, and the index, NotebookLM upload and audit cover every week in the folder. Picking a week you already have refreshes it. edpack remembers the folder per unit and offers it first next time.
 
 ### Scripted
 
