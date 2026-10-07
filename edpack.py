@@ -72,6 +72,13 @@ def week_of(name):
     m = re.search(r'week\s*(\d+)', name, re.I)
     return int(m.group(1)) if m else None
 
+def same_course(dump, course_id, module_names):
+    """Is this existing dump from the given course? Archives made before edpack recorded the
+    course id have none, so fall back to matching module names."""
+    if dump.get('course') is not None:
+        return str(dump['course']) == str(course_id)
+    return any(g.get('name') in module_names for g in dump.get('modules', []))
+
 def check_weeks(weeks, available):
     """Return an error message if any requested week is not in the course, else None."""
     if weeks is None: return None
@@ -85,7 +92,7 @@ def check_weeks(weeks, available):
 class Ed:
     def __init__(self, tok):
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.2'})
+        self.s.headers.update({'Authorization': 'Bearer ' + tok, 'User-Agent': 'edpack/0.3'})
 
     def get(self, path, **kw):
         for attempt in range(3):
@@ -139,8 +146,8 @@ def cmd_fetch(a):
         sys.exit(err)
     raw = os.path.join(a.out, '_raw'); path = os.path.join(raw, 'ed_dump.json')
     old = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else None
-    if old and str(old.get('course')) != str(a.course):
-        sys.exit('%s already holds an archive of another Ed course (%s). Pick a different folder.' % (a.out, old.get('course')))
+    if old and not same_course(old, a.course, [g['name'] for g in groups]):
+        sys.exit('%s already holds an archive of another Ed course (%s). Pick a different folder.' % (a.out, old.get('course') or 'unknown'))
     selected = [g for g in groups if weeks is None or g['week'] in weeks]
     total = sum(l.get('slide_count') or 0 for g in selected
                 for l in ([x for x in lessons if x.get('module_id') == g['id']] if g['id'] else unmoduled))
@@ -186,6 +193,8 @@ def cmd_fetch(a):
         if kept:
             log('kept %d module(s) already in this folder: %s' % (len(kept), ', '.join(g['name'] for g in kept)))
     json.dump(dump, open(path, 'w', encoding='utf-8'), indent=1)
+    # Only what was just downloaded gets rebuilt; weeks already in the folder keep their files.
+    a.fresh = {g['name'] for g in selected}
 
 
 def progress(done, total, label=''):
@@ -295,8 +304,8 @@ def ed_to_md(xml, img_sink=None):
 
 # ----------------------------------------------------------------------------- builder
 class Builder:
-    def __init__(self, out):
-        self.out = out
+    def __init__(self, out, only=None):
+        self.out = out; self.only = only   # module names to (re)build; None = all
         self.raw = os.path.join(out, '_raw')
         self.dump = json.load(open(os.path.join(self.raw, 'ed_dump.json'), encoding='utf-8'))
         self.cache = Cache(os.path.join(self.raw, 'cache'))
@@ -444,6 +453,13 @@ class Builder:
                 for n, s in enumerate(l['slides'], 1):
                     self.stats['slides'] += 1
                     base = '%02d - %s' % (n, safe(s['title'])); det = s.get('detail') or {}
+                    if self.only is not None and g['name'] not in self.only:
+                        have = [f for f in (base + '.pdf', base + '.md', base + ' (FAILED).md') if os.path.exists(os.path.join(ldir, f))]
+                        if have:   # week already in the folder and not re-downloaded: keep its files
+                            self.stats['written'] += 1
+                            lidx.append('- [%s](<%s>)' % (s['title'], have[0]))
+                            index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), have[0]))
+                            continue
                     try:
                         if s['type'] == 'webpage':
                             fn = base + '.md'; text = self.webpage(det['url'], img_dir)
@@ -472,14 +488,16 @@ class Builder:
                         self.stats['failed'].append((l['title'], s['title'], str(e)))
                     lidx.append('- [%s](<%s>)' % (s['title'], fn))
                     index.append('- [%s](<%s/%s/%s>)' % (s['title'], safe(g['name']), safe(l['title']), fn))
-                open(os.path.join(ldir, 'README.md'), 'w', encoding='utf-8').write('\n'.join(lidx) + '\n')
+                kept = self.only is not None and g['name'] not in self.only
+                if not (kept and os.path.exists(os.path.join(ldir, 'README.md'))):
+                    open(os.path.join(ldir, 'README.md'), 'w', encoding='utf-8').write('\n'.join(lidx) + '\n')
         open(os.path.join(self.out, 'README.md'), 'w', encoding='utf-8').write('\n'.join(index) + '\n')
         json.dump(self.stats, open(os.path.join(self.raw, 'build_stats.json'), 'w'), indent=1)
         log('built %d/%d slides, %d failed -> %s' % (self.stats['written'], self.stats['slides'], len(self.stats['failed']), self.out))
 
 
 def cmd_build(a):
-    Builder(a.out).build()
+    Builder(a.out, getattr(a, 'fresh', None)).build()
 
 
 # ----------------------------------------------------------------------------- NotebookLM pack
@@ -617,15 +635,15 @@ def remember_location(course_id, path):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     json.dump(cfg, open(CONFIG, 'w', encoding='utf-8'))
 
-def archive_course(path):
-    """Course id of the edpack archive in this folder, or None."""
+def existing_dump(path):
+    """The edpack archive data already in this folder, or None."""
     p = os.path.join(path, '_raw', 'ed_dump.json')
     try:
-        return str(json.load(open(p, encoding='utf-8')).get('course'))
+        return json.load(open(p, encoding='utf-8'))
     except Exception:
         return None
 
-def choose_location(course):
+def choose_location(course, module_names):
     """Pick the course folder itself; Ed's week folders are created directly inside it."""
     home = os.path.expanduser('~')
     code = safe(course.get('code') or ('ed-%s' % course['id']))
@@ -648,9 +666,9 @@ def choose_location(course):
             p = options[int(s) - 1][1]
         else:
             p = os.path.abspath(os.path.expanduser(s.strip().strip('"')))
-        other = archive_course(p)
-        if other and other != str(course['id']):
-            print('  That folder already holds an archive of a different Ed course (%s). Pick another.' % other); continue
+        old = existing_dump(p)
+        if old and not same_course(old, course['id'], module_names):
+            print('  That folder already holds an archive of a different Ed course (%s). Pick another.' % (old.get('course') or 'unknown')); continue
         if not os.path.isdir(p):
             drive = os.path.splitdrive(p)[0] + os.sep
             if not os.path.isdir(drive if os.path.splitdrive(p)[0] else os.path.dirname(p)):
@@ -717,12 +735,12 @@ def archive_one(ed, courses):
     else:
         print('  Modules are not named by week, so everything will be archived.'); weeks = None
 
-    out = choose_location(course)
+    out = choose_location(course, [m['name'] for m in L.get('modules', [])])
     remember_location(course['id'], out)
-    if archive_course(out):
-        have = [g['name'] for g in json.load(open(os.path.join(out, '_raw', 'ed_dump.json'), encoding='utf-8'))['modules']]
-        print('\n  This folder already has: %s' % '; '.join(have))
-        print('  New weeks are added; weeks you picked again are refreshed.')
+    old = existing_dump(out)
+    if old:
+        print('\n  This folder already has: %s' % '; '.join(g['name'] for g in old['modules']))
+        print('  New weeks are added; weeks you picked again are refreshed. Other weeks are left as they are.')
     mods = [m['name'] for m in L.get('modules', []) if weeks is None or week_of(m['name']) in parse_weeks(weeks)]
     print('\n  Will write into:\n    %s' % out)
     for m in mods: print('      %s' % safe(m))
